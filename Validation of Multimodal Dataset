@@ -1,0 +1,225 @@
+#############################################################################################################
+# MULTIMODAL DATASET VALIDATION WITH RMSE, MAE, AND R2 VALUES
+#############################################################################################################
+
+import pandas as pd
+import numpy as np
+import torch
+
+# Device selection
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Load your multimodal dataset
+df = pd.read_csv(r"/home/raj/RE Revision/Multimodal_Causal_W96_H4.csv")
+
+# Define numeric feature columns
+numeric_features = [
+    'is_night_rule', 'is_ffill_shortgap',
+    'ApparentTemperature', 'AirTemperature', 'DewPointTemperature',
+    'RelativeHumidity', 'WindSpeed', 'WindDirection',
+    'logs_count_window', 'logs_recency_min'
+]
+
+# Embedding columns: text_emb_mean_0...text_emb_mean_383
+embedding_features = [f'text_emb_mean_{i}' for i in range(384)]
+target_col = 'Target_t_plus_H'
+
+# Ensure all numeric and embedding columns are float, filling missing values with zero
+df[numeric_features] = df[numeric_features].apply(pd.to_numeric, errors='coerce').fillna(0)
+df[embedding_features] = df[embedding_features].apply(pd.to_numeric, errors='coerce').fillna(0)
+df[target_col] = pd.to_numeric(df[target_col], errors='coerce').fillna(0)
+
+# Explicitly cast dataframe values to float32 numpy arrays before tensor conversion
+X_numeric = torch.tensor(df[numeric_features].values.astype(np.float32)).to(device)
+X_synth_embed = torch.tensor(df[embedding_features].values.astype(np.float32)).to(device)
+y = torch.tensor(df[target_col].values.astype(np.float32)).unsqueeze(1).to(device)
+
+print("X_numeric shape:", X_numeric.shape)
+print("X_synth_embed shape:", X_synth_embed.shape)
+print("y shape:", y.shape)
+
+#############################################################################################################
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import numpy as np
+
+# --- Assumes X_numeric, X_synth_embed, and y have already been prepared following previous instructions ---
+
+# Generate random embeddings matching X_synth_embed's shape
+X_random_embed = torch.randn(X_synth_embed.shape, dtype=torch.float32)
+
+# Ensure all tensors are on CPU for DataLoader generator compatibility
+X_numeric = X_numeric.cpu()
+X_synth_embed = X_synth_embed.cpu()
+X_random_embed = X_random_embed.cpu()
+y = y.cpu()
+
+# Split train/val
+train_ratio = 0.8
+train_size = int(len(X_numeric) * train_ratio)
+Xn_train, Xn_val = X_numeric[:train_size], X_numeric[train_size:]
+Xe_train_synth, Xe_val_synth = X_synth_embed[:train_size], X_synth_embed[train_size:]
+Xe_train_rand, Xe_val_rand = X_random_embed[:train_size], X_random_embed[train_size:]
+y_train, y_val = y[:train_size], y[train_size:]
+
+# Model
+class ForecastNet(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+# Training & evaluation
+def train_and_eval(X_train, X_val, y_train, y_val):
+    train_ds = TensorDataset(X_train, y_train)
+    train_dl = DataLoader(train_ds, batch_size=64, shuffle=True)
+    model = ForecastNet(X_train.shape[1])
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    loss_fn = nn.MSELoss()
+    for epoch in range(30):
+        model.train()
+        for xb, yb in train_dl:
+            optimizer.zero_grad()
+            preds = model(xb)
+            loss = loss_fn(preds, yb)
+            loss.backward()
+            optimizer.step()
+    model.eval()
+    with torch.no_grad():
+        preds = model(X_val).squeeze()
+    rmse = np.sqrt(mean_squared_error(y_val.numpy(), preds.numpy()))
+    mae = mean_absolute_error(y_val.numpy(), preds.numpy())
+    return rmse, mae
+
+# Run experiments
+
+# A: Numeric only
+rmse_A, mae_A = train_and_eval(Xn_train, Xn_val, y_train, y_val)
+
+# B: Numeric + Random Embedding
+X_train_rand = torch.cat([Xn_train, Xe_train_rand], dim=1)
+X_val_rand = torch.cat([Xn_val, Xe_val_rand], dim=1)
+rmse_B, mae_B = train_and_eval(X_train_rand, X_val_rand, y_train, y_val)
+
+# C: Numeric + Synthetic Embedding
+X_train_synth = torch.cat([Xn_train, Xe_train_synth], dim=1)
+X_val_synth = torch.cat([Xn_val, Xe_val_synth], dim=1)
+rmse_C, mae_C = train_and_eval(X_train_synth, X_val_synth, y_train, y_val)
+
+print(f"Numeric only:          RMSE = {rmse_A:.4f}, MAE = {mae_A:.4f}")
+print(f"Numeric + Random:      RMSE = {rmse_B:.4f}, MAE = {mae_B:.4f}")
+print(f"Numeric + Synthetic:   RMSE = {rmse_C:.4f}, MAE = {mae_C:.4f}")
+
+############################################################################################################
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.decomposition import PCA
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from scipy.stats import ttest_rel, wilcoxon
+import numpy as np
+
+# ---- Assumes X_numeric, X_synth_embed, and y are pre-loaded as per previous notebook cells ----
+# If not, use the previous loading code to define them: see earlier responses
+
+# Reduce embeddings with PCA
+pca_dim = 50
+X_synth_embed_pca = torch.tensor(
+    PCA(n_components=pca_dim).fit_transform(X_synth_embed.numpy()), dtype=torch.float32
+)
+X_random_embed_pca = torch.tensor(
+    PCA(n_components=pca_dim).fit_transform(np.random.randn(*X_synth_embed.shape)), dtype=torch.float32
+)
+
+# Time-based split
+split_idx = int(len(X_numeric) * 0.8)
+Xn_train, Xn_val = X_numeric[:split_idx], X_numeric[split_idx:]
+Xe_train_synth, Xe_val_synth = X_synth_embed_pca[:split_idx], X_synth_embed_pca[split_idx:]
+Xe_train_rand, Xe_val_rand = X_random_embed_pca[:split_idx], X_random_embed_pca[split_idx:]
+y_train, y_val = y[:split_idx], y[split_idx:]
+
+# Define models and experiment logic
+class ForecastNet(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+def train_and_predict(X_train, X_val, y_train, y_val):
+    train_ds = TensorDataset(X_train, y_train)
+    train_dl = DataLoader(train_ds, batch_size=64, shuffle=True)
+    model = ForecastNet(X_train.shape[1])
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    loss_fn = nn.MSELoss()
+    for epoch in range(30):
+        model.train()
+        for xb, yb in train_dl:
+            optimizer.zero_grad()
+            preds = model(xb)
+            loss = loss_fn(preds, yb)
+            loss.backward()
+            optimizer.step()
+    model.eval()
+    with torch.no_grad():
+        preds = model(X_val).squeeze()
+    return preds.numpy()
+
+# Run all experiments to get predictions
+preds_numeric      = train_and_predict(Xn_train, Xn_val, y_train, y_val).flatten()
+
+# Numeric + Random PCA
+X_train_rand = torch.cat([Xn_train, Xe_train_rand], dim=1)
+X_val_rand   = torch.cat([Xn_val, Xe_val_rand], dim=1)
+preds_random = train_and_predict(X_train_rand, X_val_rand, y_train, y_val).flatten()
+
+# Numeric + Synthetic PCA
+X_train_synth = torch.cat([Xn_train, Xe_train_synth], dim=1)
+X_val_synth   = torch.cat([Xn_val, Xe_val_synth], dim=1)
+preds_synth   = train_and_predict(X_train_synth, X_val_synth, y_train, y_val).flatten()
+
+y_val_np = y_val.numpy().flatten()
+
+# Compute RMSE, MAE
+print(f"Numeric only:          RMSE = {np.sqrt(mean_squared_error(y_val_np, preds_numeric)):.4f}, MAE = {mean_absolute_error(y_val_np, preds_numeric):.4f}")
+print(f"Numeric + Random:      RMSE = {np.sqrt(mean_squared_error(y_val_np, preds_random)):.4f}, MAE = {mean_absolute_error(y_val_np, preds_random):.4f}")
+print(f"Numeric + Synthetic:   RMSE = {np.sqrt(mean_squared_error(y_val_np, preds_synth)):.4f}, MAE = {mean_absolute_error(y_val_np, preds_synth):.4f}")
+
+# Statistical comparisons
+errors_numeric = np.abs(y_val_np - preds_numeric)
+errors_synth   = np.abs(y_val_np - preds_synth)
+
+t_stat, p_val_t = ttest_rel(errors_numeric, errors_synth)
+print(f"Paired t-test: t = {t_stat:.4f}, p = {p_val_t:.4f}")
+
+try:
+    stat_w, p_val_w = wilcoxon(errors_numeric, errors_synth)
+    print(f"Wilcoxon test: stat = {stat_w:.4f}, p = {p_val_w:.4f}")
+except Exception as e:
+    print(f"Wilcoxon test issue: {e}")
+
+####################################################################################
