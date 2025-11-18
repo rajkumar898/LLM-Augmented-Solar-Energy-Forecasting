@@ -1,0 +1,189 @@
+import pandas as pd
+import numpy as np
+import os
+
+# ========= EDIT PATHS =========
+SOLAR_CLEAN = "/home/raj/RE Revision/solar_clean/Solar_Energy_Generation_CLEAN.csv"
+WEATHER_CSV = "/home/raj/RE Revision/Weather_Data_reordered_all.csv"
+LOGS_CSV    = "/home/raj/RE Revision/Synthetic_Maintenance_Logs_LeakageFree_v5_aligned.csv"
+EMB_CSV     = "/home/raj/RE Revision/Leakage_Free_Embeddings.csv"
+OUT_CSV     = "/home/raj/RE Revision/Multimodal_Causal_W96_H4.csv"
+
+# ========= KNOBS =========
+DATA_FREQ_MIN = 15         # 60 if hourly
+H = 4                      # +1h horizon for 15-min data
+W = 96                     # 24h window for text features
+MAX_WX_FFILL_STEPS = 8     # causal weather ffill cap (e.g., up to 2h at 15-min)
+RANDOM_STATE = 42
+
+# ========= LOAD =========
+solar = pd.read_csv(SOLAR_CLEAN, parse_dates=["Timestamp"])
+weather_head = pd.read_csv(WEATHER_CSV, nrows=0)
+w_time = "Timestamp_Aligned" if "Timestamp_Aligned" in weather_head.columns else "Timestamp"
+weather = pd.read_csv(WEATHER_CSV, parse_dates=[w_time])
+
+logs = pd.read_csv(LOGS_CSV, parse_dates=["Timestamp","EventDetectedAt","AvailableToModelAt"])
+emb  = pd.read_csv(EMB_CSV)  # should have emb_* and ideally LogID/AvailableToModelAt/SiteKey
+
+# ========= NORMALIZE KEYS & TIME =========
+for df, tcol in [(solar, "Timestamp"), (weather, w_time), (logs, "AvailableToModelAt")]:
+    df[tcol] = pd.to_datetime(df[tcol]).dt.round(f"{DATA_FREQ_MIN}min")
+
+# Harmonize SiteKey across all tables
+if "SiteKey" not in solar.columns:  solar["SiteKey"] = "GLOBAL"
+if "SiteKey" not in weather.columns:
+    if "CampusKey" in weather.columns:
+        weather = weather.rename(columns={"CampusKey":"SiteKey"})
+    else:
+        weather["SiteKey"] = "GLOBAL"
+if "SiteKey" not in logs.columns:
+    if "CampusKey" in logs.columns:
+        logs = logs.rename(columns={"CampusKey":"SiteKey"})
+    else:
+        logs["SiteKey"] = "GLOBAL"
+if "SiteKey" not in emb.columns:
+    if "CampusKey" in emb.columns:
+        emb = emb.rename(columns={"CampusKey":"SiteKey"})
+    else:
+        emb["SiteKey"] = "GLOBAL"
+
+# Unify solar time column name to Timestamp_Aligned for the final merge
+solar = solar.rename(columns={"Timestamp":"Timestamp_Aligned"})
+if w_time != "Timestamp_Aligned":
+    weather = weather.rename(columns={w_time:"Timestamp_Aligned"})
+
+# ========= WEATHER: causal, per-site limited ffill (no backfill) =========
+wx_num_cols = [c for c in weather.columns if c not in {"SiteKey","Timestamp_Aligned"} and np.issubdtype(weather[c].dtype, np.number)]
+
+def ffill_limited(group, cols, max_steps):
+    g = group.sort_values("Timestamp_Aligned").copy()
+    for c in cols:
+        vals = g[c].values
+        last = np.nan
+        run = 0
+        out = np.empty_like(vals, dtype=float)
+        for i, v in enumerate(vals):
+            if np.isnan(v):
+                run += 1
+                out[i] = last if (not np.isnan(last) and run <= max_steps) else np.nan
+            else:
+                out[i] = v
+                last = v; run = 0
+        g[c] = out
+    return g
+
+weather = weather.groupby("SiteKey", group_keys=False).apply(
+    lambda g: ffill_limited(g, wx_num_cols, MAX_WX_FFILL_STEPS)
+)
+
+# Collapse any accidental weather duplicates by mean
+weather = (weather
+    .groupby(["SiteKey","Timestamp_Aligned"], as_index=False)
+    .mean(numeric_only=True)
+    .sort_values(["SiteKey","Timestamp_Aligned"])
+    .reset_index(drop=True)
+)
+
+# ========= MERGE embeddings onto logs =========
+emb_cols = [c for c in emb.columns if c.startswith("emb_")]
+if not emb_cols:
+    raise ValueError("No emb_* columns in embeddings CSV.")
+
+# Prefer LogID join; else row-order attach (assumes same ordering)
+if "LogID" in logs.columns and "LogID" in emb.columns:
+    logs = logs.merge(emb[["LogID"] + emb_cols], on="LogID", how="left")
+else:
+    if len(logs) != len(emb):
+        raise ValueError("Embeddings and logs have different lengths and no LogID to join on.")
+    for c in emb_cols:
+        logs[c] = emb[c].values
+
+# ========= BUILD text features on grid (available ≤ t, window [t-W, t]) =========
+solar = solar.sort_values(["SiteKey","Timestamp_Aligned"]).reset_index(drop=True)
+logs  = logs.sort_values(["SiteKey","AvailableToModelAt"]).reset_index(drop=True)
+
+def text_feats_for_site(g_sw, g_logs):
+    tgrid = g_sw["Timestamp_Aligned"].to_numpy()
+    T = len(tgrid)
+    if g_logs.empty:
+        out = pd.DataFrame({"SiteKey": g_sw["SiteKey"].iat[0], "Timestamp_Aligned": g_sw["Timestamp_Aligned"]})
+        out["logs_count_window"] = 0
+        out["logs_recency_min"]  = W * DATA_FREQ_MIN
+        for j in range(len(emb_cols)): out[f"text_emb_mean_{j}"] = 0.0
+        return out
+
+    # map availability to grid index where AvailableToModelAt == t
+    avail = g_logs["AvailableToModelAt"].to_numpy()
+    idx = np.searchsorted(tgrid, avail)
+    valid = (idx >= 0) & (idx < T) & (tgrid[idx] == avail)
+    g_logs = g_logs.loc[valid].reset_index(drop=True)
+    idx = idx[valid]
+
+    D = len(emb_cols)
+    sumE = np.zeros((T, D), dtype=np.float32)
+    cntE = np.zeros(T, dtype=np.int32)
+    np.add.at(sumE, idx, g_logs[emb_cols].to_numpy(np.float32))
+    np.add.at(cntE, idx, 1)
+
+    # windowed rolling via cumulative sums
+    csumE = np.cumsum(sumE, axis=0)
+    csumC = np.cumsum(cntE)
+    rollE = csumE.copy(); rollC = csumC.copy()
+    if W > 0:
+        rollE[W:] -= csumE[:-W]
+        rollC[W:] -= csumC[:-W]
+    meanE = np.where(rollC[:, None] > 0, rollE / rollC[:, None], 0.0).astype(np.float32)
+
+    # recency
+    last_seen = -10**9
+    last_idx  = np.full(T, -10**9, dtype=np.int32)
+    for i in range(T):
+        if cntE[i] > 0: last_seen = i
+        last_idx[i] = last_seen
+    rec_steps = np.clip(np.maximum(0, np.arange(T) - last_idx), 0, W)
+    rec_min   = rec_steps * DATA_FREQ_MIN
+
+    out = pd.DataFrame({"SiteKey": g_sw["SiteKey"].iat[0], "Timestamp_Aligned": g_sw["Timestamp_Aligned"].values})
+    out["logs_count_window"] = rollC.astype(np.int32)
+    out["logs_recency_min"]  = rec_min.astype(np.float32)
+    for j in range(D):
+        out[f"text_emb_mean_{j}"] = meanE[:, j]
+    return out
+
+site_frames = []
+for site, g_sw in solar.groupby("SiteKey", sort=False):
+    g_logs = logs[logs["SiteKey"] == site]
+    site_frames.append(text_feats_for_site(g_sw, g_logs))
+
+text_feats = pd.concat(site_frames, ignore_index=True)
+
+# ========= FINAL MERGES =========
+# 1) solar + weather
+sw = solar.merge(weather, on=["SiteKey","Timestamp_Aligned"], how="left")
+# 2) add text features
+mm = sw.merge(text_feats, on=["SiteKey","Timestamp_Aligned"], how="left")
+
+# Fill text features with 0 where window empty
+text_cols = [c for c in mm.columns if c.startswith("text_emb_mean_") or c.startswith("logs_")]
+mm[text_cols] = mm[text_cols].fillna(0.0)
+
+# ========= CREATE TARGET y(t+H) & FILTER =========
+mm = mm.sort_values(["SiteKey","Timestamp_Aligned"]).reset_index(drop=True)
+if "SolarGeneration" not in mm.columns:
+    raise ValueError("SolarGeneration not found after merge. Check input columns.")
+
+mm["Target_t_plus_H"] = mm.groupby("SiteKey")["SolarGeneration"].shift(-H)
+
+# Drop last H rows per site (no target there)
+def drop_last_h(g): return g.iloc[:-H] if len(g) > H else g.iloc[0:0]
+mm = mm.groupby("SiteKey", group_keys=False).apply(drop_last_h).reset_index(drop=True)
+
+# Drop rows where future target is missing
+mm = mm[mm["Target_t_plus_H"].notna()].reset_index(drop=True)
+
+# ========= SAVE =========
+mm.to_csv(OUT_CSV, index=False)
+print(f"[OK] Multimodal dataset saved: {OUT_CSV}")
+print(f"Rows: {len(mm):,} | Text features: {len(text_cols)} | Weather ffill cap: {MAX_WX_FFILL_STEPS} steps")
+kept_flags = [c for c in ["is_night_rule","is_ffill_shortgap"] if c in mm.columns]
+print(f"Solar flags kept: {kept_flags}")
