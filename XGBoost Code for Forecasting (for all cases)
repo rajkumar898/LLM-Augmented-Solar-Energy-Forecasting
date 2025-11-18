@@ -1,0 +1,928 @@
+##################################
+# CASE 1: SOLAR + WEATHER DATA
+##################################
+
+import pandas as pd
+import numpy as np
+import time
+import os
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.manifold import TSNE
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.stats as stats
+import warnings
+warnings.filterwarnings("ignore")
+
+# Load & preprocess dataset (first 25k rows)
+df = pd.read_csv(
+    r"/home/raj/RE Revision/Multimodal_Causal_W96_H4.csv",
+    parse_dates=["Timestamp_Aligned"]
+)
+df["SolarGeneration"] = df["SolarGeneration"].fillna(0)
+df = df.dropna()
+df = df.iloc[:25000]
+
+# Temporal features
+df["hour"] = df["Timestamp_Aligned"].dt.hour
+df["dayofyear"] = df["Timestamp_Aligned"].dt.dayofyear
+df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
+df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+df["doy_sin"] = np.sin(2 * np.pi * df["dayofyear"] / 365)
+df["doy_cos"] = np.cos(2 * np.pi * df["dayofyear"] / 365)
+df["lag1"] = df["SolarGeneration"].shift(1).bfill()
+
+# Use weather + temporal features only
+weather_cols = [
+    "AirTemperature", "RelativeHumidity",
+    "WindSpeed", "WindDirection",
+    "ApparentTemperature", "DewPointTemperature"
+]
+temporal_cols = ["hour_sin", "hour_cos", "doy_sin", "doy_cos", "lag1"]
+features = weather_cols + temporal_cols
+
+X = df[features].values
+y = df["SolarGeneration"].values
+
+# Scale features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Cross-validation & training
+kf = KFold(n_splits=5, shuffle=False)
+y_pred_full = np.zeros_like(y)
+fold_metrics = []
+train_times = []
+
+start_total_train = time.time()
+
+for fold, (train_idx, test_idx) in enumerate(kf.split(X_scaled), 1):
+    X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    model = xgb.XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=7,
+        subsample=0.9,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbosity=0
+    )
+    fold_start = time.time()
+    model.fit(X_train, y_train)
+    fold_end = time.time()
+    train_times.append(fold_end - fold_start)
+
+    y_pred = model.predict(X_test)
+    y_pred_full[test_idx] = y_pred
+
+    y_pred_smoothed = pd.Series(y_pred).rolling(window=3, center=True, min_periods=1).mean().values
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred_smoothed))
+    mae = mean_absolute_error(y_test, y_pred_smoothed)
+    r2 = r2_score(y_test, y_pred_smoothed)
+
+    print(f"Fold {fold} → RMSE: {rmse:.4f}, MAE: {mae:.4f}, R²: {r2:.4f}")
+    fold_metrics.append((rmse, mae, r2))
+
+total_training_time = sum(train_times)
+
+# Smooth full prediction
+y_pred_full_smoothed = pd.Series(y_pred_full).rolling(window=3, center=True, min_periods=1).mean().values
+
+# Plotting results
+
+plt.figure(figsize=(15,7))
+plt.plot(y, label="Actual Solar Generation", color='tab:blue', alpha=0.8, linewidth=1)
+plt.plot(y_pred_full_smoothed, label="Predicted Solar Generation", color='tab:orange', alpha=0.8, linewidth=1)
+plt.xlabel("Time Steps")
+plt.ylabel("Solar Generation")
+plt.title("XGBoost Generation Prediction (Case 1: Solar + Weather)")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(7,7))
+sns.scatterplot(x=y, y=y_pred_full_smoothed, alpha=0.3)
+plt.plot([y.min(), y.max()], [y.min(), y.max()], 'r--')
+plt.xlabel("Actual")
+plt.ylabel("Predicted")
+plt.title("XGBoost Prediction Scatter Plot (Case 1: Solar + Weather)")
+plt.tight_layout()
+plt.show()
+
+tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+X_embedded = tsne.fit_transform(X_scaled)
+plt.figure(figsize=(7,6))
+plt.scatter(X_embedded[:,0], X_embedded[:,1], c=y_pred_full_smoothed, cmap='viridis', alpha=0.7)
+plt.colorbar(label='Predicted Solar Generation')
+plt.title('XGBoost t-SNE of Predictions (Case 1: Solar + Weather)')
+plt.xlabel('Component 1')
+plt.ylabel('Component 2')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+errors = y - y_pred_full_smoothed
+plt.figure(figsize=(8,4))
+sns.histplot(errors, kde=True, bins=70, color='orange')
+plt.xlabel('Prediction Error (Actual - Predicted)')
+plt.title('XGBoost Error Distribution (Case 1: Solar + Weather)')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+if "hour" in df.columns:
+    df_plot = pd.DataFrame({'error': np.abs(y - y_pred_full_smoothed), 'hour': df["hour"].values})
+    plt.figure(figsize=(12,4))
+    sns.boxplot(x='hour', y='error', data=df_plot)
+    plt.xlabel('Hour of Day')
+    plt.ylabel('Absolute Error')
+    plt.title('XGBoost Error by Hour (Case 1: Solar + Weather)')
+    plt.tight_layout()
+    plt.show()
+
+plt.figure(figsize=(6,6))
+stats.probplot(errors, dist='norm', plot=plt)
+plt.title("XGBoost QQ Plot of Residuals (Case 1: Solar + Weather)")
+plt.tight_layout()
+plt.show()
+
+# Fold Metrics Summary
+fold_metrics_arr = np.array(fold_metrics)
+mean_rmse, mean_mae, mean_r2 = fold_metrics_arr.mean(axis=0)
+print("\nFold Metrics:")
+for i, (rmse, mae, r2) in enumerate(fold_metrics, 1):
+    print(f"Fold {i}: RMSE={rmse:.4f}, MAE={mae:.4f}, R2={r2:.4f}")
+print(f"\nAvg across folds: RMSE={mean_rmse:.4f}, MAE={mean_mae:.4f}, R2={mean_r2:.4f}")
+
+# Computational Complexity
+model.save_model("xgb_case1_model.json")
+n_estimators = model.n_estimators
+max_depth = model.max_depth
+params = n_estimators * (2 ** max_depth)
+model_size_kb = os.path.getsize("xgb_case1_model.json") / 1024
+
+def measure_inference_time(model, X, repeat=100):
+    start = time.time()
+    for _ in range(repeat):
+        model.predict(X)
+    end = time.time()
+    return (end - start) * 1000 / repeat
+
+inference_time_ms = measure_inference_time(model, X_scaled)
+
+print(f"Total training time (sec): {total_training_time:.2f}")
+print(f"Approximate parameter count: {params}")
+print(f"Model size on disk: {model_size_kb:.2f} KB")
+print(f"Average inference time per sample (ms): {inference_time_ms:.3f}")
+print("Note: FLOPs are not standardized for XGBoost; timings and parameter count given as proxy.")
+
+########################################
+# CASE 2: SOLAR + TEXT EMBEDDING DATA
+########################################
+
+import pandas as pd
+import numpy as np
+import time
+import os
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.manifold import TSNE
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.stats as stats
+import warnings
+warnings.filterwarnings("ignore")
+
+# Load & preprocess dataset
+df = pd.read_csv(
+    r"/home/raj/RE Revision/Multimodal_Causal_W96_H4.csv",
+    parse_dates=["Timestamp_Aligned"]
+)
+df["SolarGeneration"] = df["SolarGeneration"].fillna(0)
+df = df.dropna()
+df = df.iloc[:25000]
+
+# Lag feature from solar generation
+df["lag1"] = df["SolarGeneration"].shift(1).bfill()
+
+# Select embeddings columns
+embedding_cols = [col for col in df.columns if col.startswith("text_emb_mean_")]
+features = ["lag1"] + embedding_cols
+
+X = df[features].values
+y = df["SolarGeneration"].values
+
+# Scale features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+kf = KFold(n_splits=5, shuffle=False)
+y_pred_full = np.zeros_like(y)
+fold_metrics = []
+train_times = []
+
+start_total_train = time.time()
+
+for fold, (train_idx, test_idx) in enumerate(kf.split(X_scaled), 1):
+    X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    model = xgb.XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=7,
+        subsample=0.9,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbosity=0
+    )
+
+    fold_start = time.time()
+    model.fit(X_train, y_train)
+    fold_end = time.time()
+    train_times.append(fold_end - fold_start)
+
+    y_pred = model.predict(X_test)
+    y_pred_full[test_idx] = y_pred
+
+    y_pred_smoothed = pd.Series(y_pred).rolling(window=3, center=True, min_periods=1).mean().values
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred_smoothed))
+    mae = mean_absolute_error(y_test, y_pred_smoothed)
+    r2 = r2_score(y_test, y_pred_smoothed)
+
+    print(f"Fold {fold} → RMSE: {rmse:.4f}, MAE: {mae:.4f}, R²: {r2:.4f}")
+    fold_metrics.append((rmse, mae, r2))
+
+total_training_time = sum(train_times)
+
+# Smoothed full prediction
+y_pred_full_smoothed = pd.Series(y_pred_full).rolling(window=3, center=True, min_periods=1).mean().values
+
+# Plotting
+
+plt.figure(figsize=(15,7))
+plt.plot(y, label="Actual Solar Generation", color='tab:blue', alpha=0.8, linewidth=1)
+plt.plot(y_pred_full_smoothed, label="Predicted Solar Generation", color='tab:orange', alpha=0.8, linewidth=1)
+plt.xlabel("Time Steps")
+plt.ylabel("Solar Generation")
+plt.title("XGBoost Generation Prediction (Case 2: Solar + Text Embeddings)")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(7,7))
+sns.scatterplot(x=y, y=y_pred_full_smoothed, alpha=0.3)
+plt.plot([y.min(), y.max()], [y.min(), y.max()], 'r--')
+plt.xlabel("Actual")
+plt.ylabel("Predicted")
+plt.title("XGBoost Prediction Scatter Plot (Case 2: Solar + Text Embeddings)")
+plt.tight_layout()
+plt.show()
+
+tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+X_embedded = tsne.fit_transform(X_scaled)
+plt.figure(figsize=(7,6))
+plt.scatter(X_embedded[:,0], X_embedded[:,1], c=y_pred_full_smoothed, cmap='viridis', alpha=0.7)
+plt.colorbar(label='Predicted Solar Generation')
+plt.title('XGBoost t-SNE of Predictions (Case 2: Solar + Text Embeddings)')
+plt.xlabel('Component 1')
+plt.ylabel('Component 2')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+errors = y - y_pred_full_smoothed
+plt.figure(figsize=(8,4))
+sns.histplot(errors, kde=True, bins=70, color='orange')
+plt.xlabel('Prediction Error (Actual - Predicted)')
+plt.title('XGBoost Prediction Error Distribution (Case 2: Solar + Text Embeddings)')
+plt.grid()
+plt.tight_layout()
+plt.show()
+
+# Boxplot error by hour if exists
+if 'hour' in df.columns:
+    df_plot = pd.DataFrame({'error': np.abs(y - y_pred_full_smoothed), 'hour': df['hour'].values})
+    plt.figure(figsize=(12,4))
+    sns.boxplot(x='hour', y='error', data=df_plot)
+    plt.xlabel('Hour of Day')
+    plt.ylabel('Absolute Error')
+    plt.title('XGBoost Prediction Error by Hour (Case 2: Solar + Text Embeddings)')
+    plt.tight_layout()
+    plt.show()
+
+plt.figure(figsize=(6,6))
+stats.probplot(errors, dist='norm', plot=plt)
+plt.title("XGBoost QQ Plot of Residuals (Case 2: Solar + Text Embeddings)")
+plt.tight_layout()
+plt.show()
+
+# Metrics summary
+fold_metrics_arr = np.array(fold_metrics)
+mean_rmse, mean_mae, mean_r2 = fold_metrics_arr.mean(axis=0)
+print("\nFold-wise Metrics:")
+for i, (rmse, mae, r2) in enumerate(fold_metrics, 1):
+    print(f"Fold {i}: RMSE={rmse:.4f}, MAE={mae:.4f}, R2={r2:.4f}")
+print(f"\nAverage metrics: RMSE={mean_rmse:.4f}, MAE={mean_mae:.4f}, R2={mean_r2:.4f}")
+
+# Computational complexity reporting
+model.save_model("xgb_case2_model.json")
+n_estimators = model.n_estimators
+max_depth = model.max_depth
+params = n_estimators * (2 ** max_depth)
+model_size_kb = os.path.getsize("xgb_case2_model.json") / 1024
+
+def measure_inference_time(model, X, repeat=100):
+    start_time = time.time()
+    for _ in range(repeat):
+        model.predict(X)
+    end_time = time.time()
+    return (end_time - start_time) * 1000 / repeat
+
+inference_time_ms = measure_inference_time(model, X_scaled)
+
+print(f"Total training time (s): {total_training_time:.2f}")
+print(f"Approximate parameter count: {params}")
+print(f"Model size (KB): {model_size_kb:.2f}")
+print(f"Average inference time per sample (ms): {inference_time_ms:.3f}")
+print("Note: FLOPs are approximate; timings and parameter count reported as proxies.")
+
+
+########################################
+# CASE 3: WEATHER + TEXT EMBEDDING DATA
+########################################
+
+import pandas as pd
+import numpy as np
+import time
+import os 
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.manifold import TSNE
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.stats as stats
+import warnings
+warnings.filterwarnings("ignore")
+
+# 1. Load & Clean, Subset to First 25,000 steps
+df = pd.read_csv(
+    r"/home/raj/RE Revision/Multimodal_Causal_W96_H4.csv",
+    parse_dates=["Timestamp_Aligned"]
+)
+df["SolarGeneration"] = df["SolarGeneration"].fillna(0)
+df = df.dropna()
+df = df.iloc[:25000]
+
+# 2. Feature Engineering (Weather + Logs)
+df["hour"] = df["Timestamp_Aligned"].dt.hour
+df["dayofyear"] = df["Timestamp_Aligned"].dt.dayofyear
+df["hour_sin"] = np.sin(2*np.pi*df["hour"] / 24)
+df["hour_cos"] = np.cos(2*np.pi*df["hour"] / 24)
+df["doy_sin"] = np.sin(2*np.pi*df["dayofyear"] / 365)
+df["doy_cos"] = np.cos(2*np.pi*df["dayofyear"] / 365)
+df["lag1"] = df["SolarGeneration"].shift(1).bfill()
+
+weather_cols = ["AirTemperature", "RelativeHumidity", "WindSpeed",
+                "WindDirection", "ApparentTemperature", "DewPointTemperature"]
+embedding_cols = [col for col in df.columns if col.startswith("log_emb_")]
+features = weather_cols + embedding_cols + ["hour_sin", "hour_cos", "doy_sin", "doy_cos", "lag1"]
+
+X = df[features].values
+y = df["SolarGeneration"].values
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+kf = KFold(n_splits=5, shuffle=False)
+y_pred_full = np.zeros_like(y)
+fold_metrics = []
+train_times = []
+model_obj = None
+start_total_train = time.time()
+
+for fold, (train_idx, test_idx) in enumerate(kf.split(X_scaled), 1):
+    X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
+    y_train = y[train_idx]
+    y_test = y[test_idx]
+
+    model = xgb.XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=7,
+        subsample=0.9,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbosity=0
+    )
+    fold_start = time.time()
+    model.fit(X_train, y_train)
+    fold_end = time.time()
+    train_times.append(fold_end - fold_start)
+    y_pred = model.predict(X_test)
+    y_pred_full[test_idx] = y_pred
+    y_pred_smoothed = pd.Series(y_pred).rolling(window=3, center=True, min_periods=1).mean().values
+
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred_smoothed))
+    mae = mean_absolute_error(y_test, y_pred_smoothed)
+    r2 = r2_score(y_test, y_pred_smoothed)
+    print(f"Fold {fold} → RMSE: {rmse:.4f}, MAE: {mae:.4f}, R²: {r2:.4f}")
+    fold_metrics.append((rmse, mae, r2))
+
+    if fold == 5:
+        model_obj = model  # Keep last fold model for complexity measurement
+
+total_train_time = time.time() - start_total_train
+
+# Optional smoothing for visualization
+y_pred_full_smoothed = pd.Series(y_pred_full).rolling(window=3, center=True, min_periods=1).mean().values
+
+# Plot generation
+plt.figure(figsize=(15,7))
+plt.plot(y, label="Actual Solar Generation", color='tab:blue', alpha=0.8, linewidth=1)
+plt.plot(y_pred_full_smoothed, label="Predicted Solar Generation", color='tab:orange', alpha=0.8, linewidth=1)
+plt.xlabel("Time Steps")
+plt.ylabel("Solar Generation")
+plt.title("XGBoost Generation Prediction (Case 3: Weather + Text Embeddings)")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.show()
+
+# Scatter Plot
+plt.figure(figsize=(7,7))
+sns.scatterplot(x=y, y=y_pred_full_smoothed, alpha=0.3)
+plt.plot([y.min(), y.max()], [y.min(), y.max()], "r--")
+plt.title("XGBoost Prediction Scatter (Case 3: Weather + Text Embeddings)")
+plt.xlabel("Actual")
+plt.ylabel("Predicted")
+plt.tight_layout()
+plt.show()
+
+# t-SNE Plot
+tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+X_embedded = tsne.fit_transform(X_scaled)
+plt.figure(figsize=(7,6))
+scatter = plt.scatter(X_embedded[:, 0], X_embedded[:, 1], c=y_pred_full_smoothed, cmap='viridis', alpha=0.7)
+plt.colorbar(scatter, label="Predicted Solar Generation")
+plt.title("XGBoost t-SNE of XGBoost Predictions (Case 3: Weather + Text Embeddings)")
+plt.xlabel("Component 1")
+plt.ylabel("Component 2")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Error Histogram
+errors = y - y_pred_full_smoothed
+plt.figure(figsize=(8,4))
+sns.histplot(errors, kde=True, bins=70, color="orange")
+plt.xlabel("Prediction Error (Actual - Predicted)")
+plt.title("XGBoost XGBoost Prediction Errors Distribution (Case 3: Weather + Text Embeddings)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Error by Hour Boxplot
+df_plot = pd.DataFrame({
+    'error': np.abs(y - y_pred_full_smoothed),
+    'hour': df["hour"].values
+})
+plt.figure(figsize=(12,4))
+sns.boxplot(x="hour", y="error", data=df_plot)
+plt.xlabel("Hour of Day")
+plt.ylabel("Absolute Error")
+plt.title("XGBoost Prediction Error by Hour (Case 3: Weather + Text Embeddings)")
+plt.tight_layout()
+plt.show()
+
+# QQ Plot
+fig = plt.figure(figsize=(6, 6))
+stats.probplot(errors, dist="norm", plot=plt)
+plt.title("XGBoost QQ Plot of XGBoost Residuals (Case 3: Weather + Text Embeddings)")
+plt.tight_layout()
+plt.show()
+
+# Print metrics
+fold_metrics_arr = np.array(fold_metrics)
+mean_rmse, mean_mae, mean_r2 = fold_metrics_arr.mean(axis=0)
+print("\nFold-wise Metrics:")
+for i, (rmse, mae, r2) in enumerate(fold_metrics, 1):
+    print(f"Fold {i}: RMSE={rmse:.4f}, MAE={mae:.4f}, R2={r2:.4f}")
+print(f"\nAverage over folds: RMSE={mean_rmse:.4f}, MAE={mean_mae:.4f}, R2={mean_r2:.4f}")
+
+# Computational Complexity
+model_obj.save_model('xgb_model_case3.json')
+
+# Parameter proxy & file size
+n_trees = model_obj.n_estimators
+max_depth = model_obj.max_depth
+params = n_trees * (2 ** max_depth)
+model_size_kb = os.path.getsize('xgb_model_case3.json') / 1024
+
+def measure_inference_time(model, X, repeat=100):
+    t0 = time.time()
+    for _ in range(repeat):
+        model.predict(X)
+    t1 = time.time()
+    return (t1 - t0) * 1000 / repeat  # ms
+
+inference_time_ms = measure_inference_time(model_obj, X_scaled)
+
+print(f"\nTotal Training Time (s): {total_train_time:.2f}")
+print(f"Approximate Number of Parameters: {params}")
+print(f"Model Size on Disk: {model_size_kb:.2f} KB")
+print(f"Average Inference Time per Sample (ms): {inference_time_ms:.3f}")
+
+print("FLOPs are approximate and not standard for XGBoost; please consider this when interpreting complexity.")
+
+
+########################################
+# CASE 4: TEXT EMBEDDING DATA ONLY
+########################################
+
+import pandas as pd
+import numpy as np
+import time
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.manifold import TSNE
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.stats as stats
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+# Load and subset first 25k rows
+df = pd.read_csv(
+    r"/home/raj/RE Revision/Multimodal_Causal_W96_H4.csv",
+    parse_dates=["Timestamp_Aligned"]
+)
+df["SolarGeneration"] = df["SolarGeneration"].fillna(0)
+df = df.dropna()
+df = df.iloc[:25000]
+
+# Select only maintenance log embeddings starting with "text_emb_mean_"
+embedding_cols = [col for col in df.columns if col.startswith("text_emb_mean_")]
+
+X = df[embedding_cols].values
+y = df["SolarGeneration"].values
+
+# Scale features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+kf = KFold(n_splits=5, shuffle=False)
+y_pred_full = np.zeros_like(y)
+fold_metrics = []
+train_times = []
+model_obj = None
+start_total_train = time.time()
+
+for fold, (train_idx, test_idx) in enumerate(kf.split(X_scaled), 1):
+    X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
+    y_train = y[train_idx]
+    y_test = y[test_idx]
+
+    model = xgb.XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=7,
+        subsample=0.9,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbosity=0
+    )
+    fold_start = time.time()
+    model.fit(X_train, y_train)
+    fold_end = time.time()
+    train_times.append(fold_end - fold_start)
+
+    y_pred = model.predict(X_test)
+    y_pred_full[test_idx] = y_pred
+
+    y_pred_smoothed = pd.Series(y_pred).rolling(window=3, center=True, min_periods=1).mean().values
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred_smoothed))
+    mae = mean_absolute_error(y_test, y_pred_smoothed)
+    r2 = r2_score(y_test, y_pred_smoothed)
+    print(f"Fold {fold} → RMSE: {rmse:.4f}, MAE: {mae:.4f}, R²: {r2:.4f}")
+    fold_metrics.append((rmse, mae, r2))
+
+    if fold == 5:
+        model_obj = model  # Save last fold model
+
+total_train_time = sum(train_times)
+y_pred_full_smoothed = pd.Series(y_pred_full).rolling(window=3, center=True, min_periods=1).mean().values
+
+# Generation plot
+plt.figure(figsize=(15,7))
+plt.plot(y, label="Actual Solar Generation", color='tab:blue', alpha=0.8, linewidth=1)
+plt.plot(y_pred_full_smoothed, label="Predicted Solar Generation", color='tab:orange', alpha=0.8, linewidth=1)
+plt.xlabel("Time Steps")
+plt.ylabel("Solar Generation")
+plt.title("XGBoost Generation Prediction (Case 4: Maintenance Log Embeddings Only)")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.show()
+
+# Scatter plot
+plt.figure(figsize=(7,7))
+sns.scatterplot(x=y, y=y_pred_full_smoothed, alpha=0.3)
+plt.plot([y.min(), y.max()], [y.min(), y.max()], "r--")
+plt.title("XGBoost Prediction Scatter (Case 4: Maintenance Log Embeddings Only)")
+plt.xlabel("Actual")
+plt.ylabel("Predicted")
+plt.tight_layout()
+plt.show()
+
+# t-SNE plot
+tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+X_embedded = tsne.fit_transform(X_scaled)
+plt.figure(figsize=(7,6))
+scatter = plt.scatter(X_embedded[:, 0], X_embedded[:, 1], c=y_pred_full_smoothed, cmap='viridis', alpha=0.7)
+plt.colorbar(scatter, label="Predicted Solar Generation")
+plt.title("XGBoost t-SNE of Predictions (Case 4: Maintenance Log Embeddings Only)")
+plt.xlabel("Component 1")
+plt.ylabel("Component 2")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Error histogram
+errors = y - y_pred_full_smoothed
+plt.figure(figsize=(8,4))
+sns.histplot(errors, kde=True, bins=70, color="orange")
+plt.xlabel("Prediction Error (Actual - Predicted)")
+plt.title("XGBoost Distribution of Prediction Errors (Case 4: Maintenance Log Embeddings Only)")
+plt.grid()
+plt.tight_layout()
+plt.show()
+
+# Boxplot error by hour (if "hour" present in df)
+if "hour" in df.columns:
+    df_plot = pd.DataFrame({
+        "error": np.abs(y - y_pred_full_smoothed),
+        "hour": df["hour"].values
+    })
+    plt.figure(figsize=(12,4))
+    sns.boxplot(x="hour", y="error", data=df_plot)
+    plt.xlabel("Hour of Day")
+    plt.ylabel("Absolute Error")
+    plt.title("XGBoost Prediction Error by Hour (Case 4: Maintenance Log Embeddings Only)")
+    plt.tight_layout()
+    plt.show()
+
+# QQ plot
+fig = plt.figure(figsize=(6,6))
+stats.probplot(errors, dist="norm", plot=plt)
+plt.title("XGBoost QQ Plot of Residuals")
+plt.tight_layout()
+plt.show()
+
+# Fold-wise metrics and averages
+fold_metrics_arr = np.array(fold_metrics)
+mean_rmse, mean_mae, mean_r2 = fold_metrics_arr.mean(axis=0)
+print("\nFold-wise Metrics:")
+for i, (rmse, mae, r2) in enumerate(fold_metrics, 1):
+    print(f"Fold {i}: RMSE={rmse:.4f}, MAE={mae:.4f}, R2={r2:.4f}")
+print(f"\nAverage metrics: RMSE={mean_rmse:.4f}, MAE={mean_mae:.4f}, R2={mean_r2:.4f}")
+
+# Computational complexity measures
+model_obj.save_model("xgb_model_case4.json")
+n_trees = model_obj.n_estimators
+max_depth = model_obj.max_depth
+params = n_trees * (2 ** max_depth)
+model_size_kb = os.path.getsize("xgb_model_case4.json") / 1024
+
+def measure_inference_time(model, X, repeat=100):
+    start = time.time()
+    for _ in range(repeat):
+        model.predict(X)
+    end = time.time()
+    return (end - start) * 1000 / repeat
+
+inference_time_ms = measure_inference_time(model_obj, X_scaled)
+
+print(f"\nTotal Training Time (s): {total_train_time:.2f}")
+print(f"Approximate Number of Parameters: {params}")
+print(f"Model Size on Disk: {model_size_kb:.2f} KB")
+print(f"Average Inference Time per Sample (ms): {inference_time_ms:.3f}")
+
+print("Note: FLOPs for XGBoost not standardized; results are proxies.")
+
+
+###################################################################
+# CASE 5: MULTIMODAL DATA (SOLAR + WEATHER + TEXT EMBEDDING)
+###################################################################
+
+import pandas as pd
+import numpy as np
+import time
+import os
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.manifold import TSNE
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.stats as stats
+import warnings
+warnings.filterwarnings("ignore")
+
+# Load & preprocess dataset
+df = pd.read_csv(
+    r"/home/raj/RE Revision/Multimodal_Causal_W96_H4.csv",
+    parse_dates=["Timestamp_Aligned"]
+)
+df["SolarGeneration"] = df["SolarGeneration"].fillna(0)
+df = df.dropna()
+# Use entire dataset (or first 25000 if needed)
+df = df.iloc[:25000]
+
+# Select all text_emb_mean_ columns for maintenance log embeddings
+embedding_cols = [col for col in df.columns if col.startswith("text_emb_mean_")]
+
+# Verify selection
+if len(embedding_cols) == 0:
+    raise ValueError("No columns starting with 'text_emb_mean_' found. Check your dataset.")
+
+# Combine features: weather + embeddings + temporal features
+weather_cols = [
+    "AirTemperature", "RelativeHumidity", "WindSpeed",
+    "WindDirection", "ApparentTemperature", "DewPointTemperature"
+]
+# Cyclical temporal features
+df["hour"] = df["Timestamp_Aligned"].dt.hour
+df["dayofyear"] = df["Timestamp_Aligned"].dt.dayofyear
+df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
+df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+df["doy_sin"] = np.sin(2 * np.pi * df["dayofyear"] / 365)
+df["doy_cos"] = np.cos(2 * np.pi * df["dayofyear"] / 365)
+df["lag1"] = df["SolarGeneration"].shift(1).bfill()
+
+features = weather_cols + embedding_cols + ["hour_sin", "hour_cos", "doy_sin", "doy_cos", "lag1"]
+X = df[features].values
+y = df["SolarGeneration"].values
+
+# Scale features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Cross-validation setup
+kf = KFold(n_splits=5, shuffle=False)
+y_pred_full = np.zeros_like(y)
+fold_metrics = []
+train_times = []
+
+# Training loop
+start_time = time.time()
+
+for fold, (train_idx, test_idx) in enumerate(kf.split(X_scaled), 1):
+    X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    model = xgb.XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=7,
+        subsample=0.9,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbosity=0
+    )
+    start_fold_time = time.time()
+    model.fit(X_train, y_train)
+    end_fold_time = time.time()
+    train_times.append(end_fold_time - start_fold_time)
+
+    y_pred = model.predict(X_test)
+    y_pred_full[test_idx] = y_pred
+
+    y_pred_smoothed = pd.Series(y_pred).rolling(window=3, center=True, min_periods=1).mean().values
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred_smoothed))
+    mae = mean_absolute_error(y_test, y_pred_smoothed)
+    r2 = r2_score(y_test, y_pred_smoothed)
+    print(f"Fold {fold} -> RMSE: {rmse:.4f}, MAE: {mae:.4f}, R2: {r2:.4f}")
+    fold_metrics.append((rmse, mae, r2))
+
+total_training_time = time.time() - start_time
+
+# Smoothed full sequence predictions
+y_pred_full_smoothed = pd.Series(y_pred_full).rolling(window=3, center=True, min_periods=1).mean().values
+
+# Plot: Actual vs Predicted
+plt.figure(figsize=(15,7))
+plt.plot(y, label='Actual Solar Generation', color='blue', alpha=0.8)
+plt.plot(y_pred_full_smoothed, label='Predicted Solar Generation', color='orange', alpha=0.8)
+plt.xlabel('Time Steps')
+plt.ylabel('Solar Generation')
+plt.title('XGBoost Generation Prediction (Case 5: Multimodal)')
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.show()
+
+# Scatter plot
+plt.figure(figsize=(7,7))
+sns.scatterplot(x=y, y=y_pred_full_smoothed, alpha=0.3)
+plt.plot([y.min(), y.max()], [y.min(), y.max()], 'r--')
+plt.xlabel('Actual')
+plt.ylabel('Predicted')
+plt.title('XGBoost Predicted Scatter (Case 5: Multimodal)')
+plt.tight_layout()
+plt.show()
+
+# t-SNE visualization
+tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+X_embedded = tsne.fit_transform(X_scaled)
+plt.figure(figsize=(7,6))
+plt.scatter(X_embedded[:,0], X_embedded[:,1], c=y_pred_full_smoothed, cmap='viridis', alpha=0.7)
+plt.colorbar(label='Predicted Solar Generation')
+plt.title('XGBoost t-SNE of Predictions (Case 5: Multimodal)')
+plt.xlabel('Component 1')
+plt.ylabel('Component 2')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Errors distribution
+errors = y - y_pred_full_smoothed
+plt.figure(figsize=(8,4))
+sns.histplot(errors, kde=True, bins=70, color='orange')
+plt.xlabel('Error (Actual - Predicted)')
+plt.title('XGBoost Error Distribution of Predictions (Case 5: Multimodal)')
+plt.grid()
+plt.tight_layout()
+plt.show()
+
+# If 'hour' is available, plot error by hour
+if "hour" in df.columns:
+    error_df = pd.DataFrame({
+        'error': np.abs(y - y_pred_full_smoothed),
+        'hour': df['hour'].values
+    })
+    plt.figure(figsize=(12,4))
+    sns.boxplot(x='hour', y='error', data=error_df)
+    plt.xlabel('Hour of Day')
+    plt.ylabel('Absolute Error')
+    plt.title('XGBoost Error by Hour of Day (Case 5: Multimodal)')
+    plt.tight_layout()
+    plt.show()
+
+# QQ plot for residuals
+plt.figure(figsize=(6,6))
+stats.probplot(errors, dist='norm', plot=plt)
+plt.title('XGBoost QQ Plot of Residuals (Case 5: Multimodal)')
+plt.tight_layout()
+plt.show()
+
+# Metrics
+fold_metrics = np.array(fold_metrics)
+mean_rmse, mean_mae, mean_r2 = fold_metrics.mean(axis=0)
+print(f"Avg RMSE: {mean_rmse:.4f}")
+print(f"Avg MAE: {mean_mae:.4f}")
+print(f"Avg R2: {mean_r2:.4f}")
+
+# Model complexity info for resource estimaion
+model = model
+model.save_model('xgb_fullmodel.json')
+n_estimators = model.n_estimators
+max_depth = model.max_depth
+params = n_estimators * (2 ** max_depth)
+model_size_kb = os.path.getsize('xgb_fullmodel.json') / 1024
+
+def measure_inference_time(model, X, repeat=100):
+    start_time = time.time()
+    for _ in range(repeat):
+        model.predict(X)
+    end_time = time.time()
+    return (end_time - start_time) * 1000 / repeat
+
+inference_time_ms = measure_inference_time(model, X_scaled)
+
+print(f"Total training time: {total_training_time:.2f} sec")
+print(f"Model approximate parameters: {params}")
+print(f"Model size: {model_size_kb:.2f} KB")
+print(f"Inference time per sample: {inference_time_ms:.3f} ms")
+print("Note: FLOPs are not standardly measured; proxies used.")
+
