@@ -1,0 +1,468 @@
+##################################
+# PERSISTENCE BASELINE 
+##################################
+
+import pandas as pd
+import numpy as np
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# Load and prepare data
+df = pd.read_csv(
+    r"/home/raj/RE Revision/Multimodal_Causal_W96_H4.csv",
+    parse_dates=["Timestamp_Aligned"]
+)
+df = df.sort_values("Timestamp_Aligned").reset_index(drop=True)
+df["SolarGeneration"] = df["SolarGeneration"].fillna(0)
+df = df.dropna(subset=["SolarGeneration"])
+df = df.iloc[:25000]
+
+# 1-hour ahead (can set h to other values)
+h = 1
+
+y_true = df["SolarGeneration"].values[h:]
+y_pred_persistence = df["SolarGeneration"].values[:-h]  # t+1 = t
+
+rmse = np.sqrt(mean_squared_error(y_true, y_pred_persistence))
+mae = mean_absolute_error(y_true, y_pred_persistence)
+r2 = r2_score(y_true, y_pred_persistence)
+print(f"Persistence Baseline: RMSE={rmse:.4f}, MAE={mae:.4f}, R²={r2:.4f}")
+
+################################################
+# CSI (CLEAR SKY INDEX) - PERSISTENCE BASELINE 
+################################################
+
+# Assume we can simulate clear-sky as a cosine (not accurate but works for baseline comparison!)
+# For real studies, use PVLib or real clear-sky GHI for your site.
+
+from datetime import timedelta
+
+# Simple synthetic daily clear-sky estimate (0 at night, scaled max at noon)
+df["hour_frac"] = df["Timestamp_Aligned"].dt.hour + df["Timestamp_Aligned"].dt.minute / 60
+clear_sky = np.maximum(0, np.cos((df["hour_frac"] - 12) / 12 * np.pi))
+df["clear_sky"] = clear_sky * (df["SolarGeneration"].max()) # scale to daily max
+
+# Compute Clear Sky Index (CSI)
+df["CSI"] = df["SolarGeneration"] / np.maximum(1, df["clear_sky"])
+
+# CSI Persistence forecast: future Solar = forecasted CSI * future clear-sky
+y_true = df["SolarGeneration"].values[h:]
+csi_pred = df["CSI"].values[:-h]
+future_clear_sky = df["clear_sky"].values[h:]
+y_pred_csi = csi_pred * future_clear_sky
+
+rmse_csi = np.sqrt(mean_squared_error(y_true, y_pred_csi))
+mae_csi = mean_absolute_error(y_true, y_pred_csi)
+r2_csi = r2_score(y_true, y_pred_csi)
+print(f"CSI Persistence Baseline: RMSE={rmse_csi:.4f}, MAE={mae_csi:.4f}, R²={r2_csi:.4f}")
+
+#############################################################################
+# FINAL CODE
+##############################################################################
+
+# ============================================================
+# Reviewer #2 Requirements: Baselines + Modern TS + Intervals
+# Dataset: /home/raj/RE Revision/Multimodal_Causal_W96_H4.csv
+# ============================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler
+import lightgbm as lgb
+
+# ------------------------------------------------------------
+# 0. CONFIGURATION
+# ------------------------------------------------------------
+CSV_PATH    = r"/home/raj/RE Revision/Multimodal_Causal_W96_H4.csv"
+TIME_COL    = "Timestamp_Aligned"
+TARGET_COL  = "SolarGeneration"
+HORIZON     = 4   # 4 x 15-min = 1 hour ahead
+SPLIT_DATE  = "2023-01-01"   # preferred date split, but we will fall back if needed
+
+# candidate clear-sky columns (optional; used for CSI persistence)
+CSI_CANDIDATES = [
+    "ClearSkyGeneration", "ClearSky", "ClearSky_Generation",
+    "PV_ClearSky", "GHI_clear", "GHI_ClearSky"
+]
+
+# ------------------------------------------------------------
+# 1. METRICS + UTILS
+# ------------------------------------------------------------
+
+def rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+def mae(y_true, y_pred):
+    return mean_absolute_error(y_true, y_pred)
+
+def nrmse(y_true, y_pred):
+    # normalized by range
+    return rmse(y_true, y_pred) / (np.max(y_true) - np.min(y_true) + 1e-9)
+
+def nmae(y_true, y_pred):
+    return mae(y_true, y_pred) / (np.max(y_true) - np.min(y_true) + 1e-9)
+
+def summarize_metrics(name, y_true, y_pred):
+    """Compute metrics after dropping any NaNs in y_true/y_pred."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
+    if mask.sum() == 0:
+        raise ValueError(f"[{name}] No valid samples after removing NaNs.")
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
+    return {
+        "model": name,
+        "RMSE": rmse(y_true, y_pred),
+        "MAE": mae(y_true, y_pred),
+        "R2": r2_score(y_true, y_pred),
+        "nRMSE": nrmse(y_true, y_pred),
+        "nMAE": nmae(y_true, y_pred),
+    }
+
+def pinball_loss(y_true, y_pred, q):
+    """Quantile (pinball) loss for a given quantile q, robust to NaNs."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
+    if mask.sum() == 0:
+        raise ValueError(f"[Pinball q={q}] No valid samples after removing NaNs.")
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
+    e = y_true - y_pred
+    return np.mean(np.maximum(q * e, (q - 1) * e))
+
+# ------------------------------------------------------------
+# 2. LOAD DATA + CAUSAL H-STEP TARGET
+# ------------------------------------------------------------
+
+df = pd.read_csv(CSV_PATH, parse_dates=[TIME_COL])
+df = df.sort_values(TIME_COL).reset_index(drop=True)
+
+print("Dataset shape:", df.shape)
+print("Time range:", df[TIME_COL].min(), "→", df[TIME_COL].max())
+
+# Use existing Target_t_plus_H if present; otherwise construct y_future
+if "Target_t_plus_H" in df.columns:
+    df["y_future"] = df["Target_t_plus_H"]
+else:
+    df["y_future"] = df[TARGET_COL].shift(-HORIZON)
+
+# Drop rows without future target (e.g., last HORIZON rows or NaNs)
+df = df.dropna(subset=["y_future"]).reset_index(drop=True)
+
+# ------------------------------------------------------------
+# 3. TRAIN/TEST SPLIT (DATE-BASED WITH 80/20 FALLBACK)
+# ------------------------------------------------------------
+
+# Try preferred temporal split
+train_mask = df[TIME_COL] < SPLIT_DATE
+test_mask  = df[TIME_COL] >= SPLIT_DATE
+
+train_df = df.loc[train_mask].copy()
+test_df  = df.loc[test_mask].copy()
+
+if (len(train_df) == 0) or (len(test_df) == 0):
+    # Fallback: 80/20 split based on time order
+    print("\n[WARNING] Date-based split produced empty train or test set.")
+    print("[INFO] Falling back to 80/20 time-based split.\n")
+
+    df = df.sort_values(TIME_COL).reset_index(drop=True)
+    n_total   = len(df)
+    split_idx = int(n_total * 0.8)
+
+    train_df = df.iloc[:split_idx].copy()
+    test_df  = df.iloc[split_idx:].copy()
+
+# Final train/test info
+print(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
+print("Train period:", train_df[TIME_COL].min(), "→", train_df[TIME_COL].max())
+print("Test period :", test_df[TIME_COL].min(), "→", test_df[TIME_COL].max())
+
+y_train = train_df["y_future"].values
+y_test  = test_df["y_future"].values
+
+# Feature columns: all numeric except time + original target + shifted target + Target_t_plus_H
+exclude_cols = {TIME_COL, TARGET_COL, "y_future", "Target_t_plus_H"}
+feature_cols = [
+    c for c in df.columns
+    if c not in exclude_cols and np.issubdtype(df[c].dtype, np.number)
+]
+
+print("Number of numeric features used:", len(feature_cols))
+
+X_train = train_df[feature_cols].values
+X_test  = test_df[feature_cols].values
+
+print("X_train shape:", X_train.shape)
+print("X_test  shape:", X_test.shape)
+
+if X_train.shape[0] == 0 or X_test.shape[0] == 0:
+    raise ValueError("Train or test features are empty even after fallback split. "
+                     "Check your dataset and splitting logic.")
+
+# Standardization (fitted only on training → causal)
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled  = scaler.transform(X_test)
+
+# ------------------------------------------------------------
+# 4. BASELINE 1: PERSISTENCE (NAIVE PV FORECAST)
+# ------------------------------------------------------------
+# Predict y_{t+h} ≈ y_t (perfect persistence)
+# Use SolarGeneration at time t, aligned with test_df index
+y_pred_persistence_raw = test_df[TARGET_COL].values  # may contain NaNs
+
+metrics_persistence = summarize_metrics("Persistence", y_test, y_pred_persistence_raw)
+print("\n=== Persistence Baseline ===")
+for k, v in metrics_persistence.items():
+    print(f"{k}: {v:.5f}" if isinstance(v, float) else f"{k}: {v}")
+
+# ------------------------------------------------------------
+# 5. BASELINE 2: CLEAR-SKY INDEX PERSISTENCE (CSI)
+# ------------------------------------------------------------
+
+clear_col = None
+for cand in CSI_CANDIDATES:
+    if cand in df.columns:
+        clear_col = cand
+        break
+
+metrics_csi = None
+if clear_col is not None:
+    print(f"\nUsing '{clear_col}' for clear-sky generation (CSI baseline).")
+    eps = 1e-9
+
+    # Work on a copy so we don't mess up original df
+    df_csi = df.copy()
+
+    # Clear-sky index
+    df_csi["k_index"] = df_csi[TARGET_COL] / (df_csi[clear_col] + eps)
+    df_csi["k_index"].replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_csi["k_index"].fillna(method="ffill", inplace=True)
+
+    # Future clear-sky generation for horizon H
+    df_csi["y_cs_future"] = df_csi[clear_col].shift(-HORIZON)
+
+    # CSI persistence prediction: ŷ_{t+h} = k_t * y_cs_{t+h}
+    df_csi["y_pred_csi_all"] = df_csi["k_index"] * df_csi["y_cs_future"]
+
+    # Align to test_df index
+    test_df_csi = df_csi.loc[test_df.index].copy()
+
+    y_true_csi = test_df_csi["y_future"].values
+    y_pred_csi_raw = test_df_csi["y_pred_csi_all"].values
+
+    try:
+        metrics_csi = summarize_metrics("CSI-Persistence", y_true_csi, y_pred_csi_raw)
+        print("\n=== Clear-Sky Index Persistence Baseline ===")
+        for k, v in metrics_csi.items():
+            print(f"{k}: {v:.5f}" if isinstance(v, float) else f"{k}: {v}")
+    except ValueError as e:
+        print("\n[WARNING]", e)
+else:
+    print("\n[WARNING] No clear-sky column found for CSI baseline. "
+          "Add one of:", CSI_CANDIDATES)
+
+# ------------------------------------------------------------
+# 6. MODERN TIME-SERIES BASELINE: N-BEATS (NeuralForecast)
+# ------------------------------------------------------------
+
+metrics_nbeats = None
+
+try:
+    from neuralforecast import NeuralForecast
+    from neuralforecast.models import NBEATS
+
+    print("\n[INFO] 'neuralforecast' found. Training N-BEATS baseline...")
+
+    # Prepare panel DataFrame: unique_id, ds, y
+    Y_df = df[[TIME_COL, TARGET_COL]].copy()
+    Y_df["unique_id"] = "PV"
+    Y_df = Y_df.rename(columns={TIME_COL: "ds", TARGET_COL: "y"})
+
+    # Define train period to match train_df
+    train_start = train_df[TIME_COL].min()
+    train_end   = train_df[TIME_COL].max()
+
+    Y_train = Y_df[(Y_df["ds"] >= train_start) & (Y_df["ds"] <= train_end)].copy()
+    Y_full  = Y_df.copy()
+
+    # Use 96-step lookback (W96) and H=HORIZON steps ahead (1-hour ahead)
+    input_size = 96
+
+    nbeats_model = NBEATS(
+        input_size=input_size,
+        h=HORIZON,
+        max_steps=300,
+        enable_progress_bar=False,
+    )
+
+    nf = NeuralForecast(models=[nbeats_model], freq="15min")
+    nf.fit(df=Y_train)
+
+    # Rolling-style evaluation on full Y_df:
+    cv_df = nf.cross_validation(
+        df=Y_full,
+        test_size=len(test_df),
+        step_size=1
+    )
+
+    # Take last len(test_df) rows for the last window
+    cv_last = cv_df.groupby("unique_id").tail(len(test_df)).copy()
+    cv_last = cv_last.sort_values("ds")
+
+    test_df_sorted = test_df.sort_values(TIME_COL)
+
+    merged = pd.merge(
+        test_df_sorted[[TIME_COL, "y_future"]],
+        cv_last[["ds", "NBEATS"]],
+        left_on=TIME_COL,
+        right_on="ds",
+        how="inner"
+    )
+
+    if len(merged) > 0:
+        y_true_nbeats = merged["y_future"].values
+        y_pred_nbeats_raw = merged["NBEATS"].values
+
+        metrics_nbeats = summarize_metrics("N-BEATS", y_true_nbeats, y_pred_nbeats_raw)
+        print("\n=== N-BEATS Modern TS Baseline ===")
+        for k, v in metrics_nbeats.items():
+            print(f"{k}: {v:.5f}" if isinstance(v, float) else f"{k}: {v}")
+    else:
+        print("\n[WARNING] N-BEATS predictions could not be aligned with test set.")
+
+except ImportError:
+    print("\n[WARNING] 'neuralforecast' not installed. "
+          "Install with 'pip install neuralforecast' to run N-BEATS baseline.")
+
+# ------------------------------------------------------------
+# 7. QUANTILE LIGHTGBM (PREDICTION INTERVALS)
+# ------------------------------------------------------------
+
+def train_lgb_quantile(alpha):
+    params = {
+        "objective": "quantile",
+        "alpha": alpha,
+        "learning_rate": 0.03,
+        "num_leaves": 60,
+        "min_data_in_leaf": 30,
+        "subsample": 0.9,
+        "colsample_bytree": 0.9,
+        "n_estimators": 1800,
+        "verbose": -1,
+        "random_state": 42,
+    }
+    model = lgb.LGBMRegressor(**params)
+    model.fit(X_train_scaled, y_train)
+    return model
+
+print("\n[INFO] Training quantile LightGBM models (q10, q50, q90)...")
+
+m_q10 = train_lgb_quantile(0.10)
+m_q50 = train_lgb_quantile(0.50)
+m_q90 = train_lgb_quantile(0.90)
+
+q10_pred = m_q10.predict(X_test_scaled)
+q50_pred = m_q50.predict(X_test_scaled)  # median forecast
+q90_pred = m_q90.predict(X_test_scaled)
+
+# Point-forecast metrics for median
+metrics_lgb_median = summarize_metrics("LGBM-Quantile (q50)", y_test, q50_pred)
+print("\n=== LightGBM Quantile (Median) ===")
+for k, v in metrics_lgb_median.items():
+    print(f"{k}: {v:.5f}" if isinstance(v, float) else f"{k}: {v}")
+
+# Quantile / pinball losses
+pl_q10 = pinball_loss(y_test, q10_pred, 0.10)
+pl_q50 = pinball_loss(y_test, q50_pred, 0.50)
+pl_q90 = pinball_loss(y_test, q90_pred, 0.90)
+
+print("\n=== Pinball Loss (Quantiles) ===")
+print(f"q=0.10: {pl_q10:.6f}")
+print(f"q=0.50: {pl_q50:.6f}")
+print(f"q=0.90: {pl_q90:.6f}")
+
+# Coverage of 80% interval [q10, q90]
+mask_interval = ~np.isnan(y_test) & ~np.isnan(q10_pred) & ~np.isnan(q90_pred)
+coverage_80 = np.mean((y_test[mask_interval] >= q10_pred[mask_interval]) &
+                      (y_test[mask_interval] <= q90_pred[mask_interval]))
+avg_width_80 = np.mean(q90_pred[mask_interval] - q10_pred[mask_interval])
+
+print("\n=== Prediction Interval Coverage (q10–q90) ===")
+print(f"Nominal coverage: 0.80, Empirical coverage: {coverage_80:.4f}")
+print(f"Average interval width: {avg_width_80:.4f}")
+
+# ------------------------------------------------------------
+# 8. RELIABILITY PLOT FOR QUANTILES
+# ------------------------------------------------------------
+
+quantiles = [0.10, 0.50, 0.90]
+pred_list = [q10_pred, q50_pred, q90_pred]
+
+empirical = []
+for q, y_hat in zip(quantiles, pred_list):
+    y_true_q = np.asarray(y_test, dtype=float)
+    y_hat_q  = np.asarray(y_hat, dtype=float)
+    mask_q = ~np.isnan(y_true_q) & ~np.isnan(y_hat_q)
+    empirical.append(np.mean(y_true_q[mask_q] <= y_hat_q[mask_q]))
+
+plt.figure(figsize=(6, 6))
+plt.plot([0, 1], [0, 1], "k--", label="Ideal")
+plt.scatter(quantiles, empirical, s=60)
+for q, e in zip(quantiles, empirical):
+    plt.text(q + 0.01, e, f"{q:.2f}", fontsize=9)
+
+plt.xlabel("Nominal quantile", fontsize=12)
+plt.ylabel("Empirical CDF (P(Y ≤ ŷ_q))", fontsize=12)
+plt.title("Reliability of LGBM Quantile Forecasts", fontsize=13)
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ------------------------------------------------------------
+# 9. OPTIONAL: TIME-SERIES PLOT WITH INTERVALS
+# ------------------------------------------------------------
+
+N_plot = min(500, len(test_df))  # adjust if you want fewer/more
+idx_plot = -N_plot
+
+time_test = test_df[TIME_COL].values
+
+plt.figure(figsize=(12, 5))
+plt.plot(time_test[idx_plot:], y_test[idx_plot:], label="True", linewidth=1.5)
+plt.plot(time_test[idx_plot:], q50_pred[idx_plot:], label="q50 (median)", linewidth=1.2)
+plt.fill_between(
+    time_test[idx_plot:],
+    q10_pred[idx_plot:],
+    q90_pred[idx_plot:],
+    alpha=0.3,
+    label="80% PI [q10, q90]"
+)
+plt.xlabel("Time", fontsize=12)
+plt.ylabel("Solar Generation", fontsize=12)
+plt.title("Quantile LightGBM Forecast with Prediction Intervals", fontsize=13)
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ------------------------------------------------------------
+# 10. SUMMARY TABLE OF MAIN BASELINES
+# ------------------------------------------------------------
+
+summary_rows = [metrics_persistence, metrics_lgb_median]
+if metrics_csi is not None:
+    summary_rows.append(metrics_csi)
+if metrics_nbeats is not None:
+    summary_rows.append(metrics_nbeats)
+
+summary_df = pd.DataFrame(summary_rows)
+print("\n=== Summary of Main Models (Test Set) ===")
+print(summary_df)
+
+
