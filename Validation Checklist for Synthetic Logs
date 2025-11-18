@@ -1,0 +1,298 @@
+# ============================================================
+# Validation script for synthetic maintenance logs (reviewer-ready)
+# - Saves: logs_validation_report.md, logs_validation_metrics.json
+# - Optional figures: val_detection_lag.png, val_daily_rate.png, val_type_component_heatmap.png
+# ============================================================
+
+import os, json, re
+from collections import OrderedDict
+from datetime import timedelta
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ---------------- CONFIG (EDIT) ----------------
+MERGED_FILE = r"/home/raj/RE Revision/Merged_Solar_Weather.csv"
+LOGS_FILE   = r"/home/raj/RE Revision/Synthetic_Maintenance_Logs_LeakageFree_v5.csv"
+
+DATA_FREQ_MIN   = 15     # must match generator
+LAG_STEPS       = 4      # Δ (steps) used in generator
+HORIZON_STEPS   = 4      # forecast horizon (steps)
+DELTA_TOL_MIN   = 1      # allowed tolerance in minutes for Δ checks
+
+# Optional figure toggles
+MAKE_FIGS       = True
+OUT_DIR         = os.path.dirname(LOGS_FILE) if os.path.dirname(LOGS_FILE) else "."
+# ------------------------------------------------
+
+
+def minutes_diff(a, b):
+    return (pd.to_datetime(a) - pd.to_datetime(b)).dt.total_seconds() / 60.0
+
+
+def section(title):
+    print("\n" + "="*len(title))
+    print(title)
+    print("="*len(title))
+
+
+def warn(msg):
+    print(f"[WARN] {msg}")
+
+
+def passfail(flag):
+    return "PASS" if flag else "FAIL"
+
+
+# ---------- Load ----------
+if not os.path.exists(MERGED_FILE):
+    raise FileNotFoundError(f"Missing MERGED_FILE: {MERGED_FILE}")
+if not os.path.exists(LOGS_FILE):
+    raise FileNotFoundError(f"Missing LOGS_FILE: {LOGS_FILE}")
+
+df = pd.read_csv(MERGED_FILE, parse_dates=["Timestamp_Aligned"])
+logs = pd.read_csv(LOGS_FILE, parse_dates=["Timestamp","EventDetectedAt","AvailableToModelAt"])
+
+if "SiteKey" not in df.columns:
+    df["SiteKey"] = "GLOBAL"
+if "SiteKey" not in logs.columns:
+    logs["SiteKey"] = "GLOBAL"
+
+# ---------- Report containers ----------
+checks = OrderedDict()
+metrics = OrderedDict()
+details = OrderedDict()  # strings/tables
+
+# ========== A) HARD INVARIANTS ==========
+section("A) HARD INVARIANTS")
+
+# A1 Schema
+req_logs_cols = ["LogID","Timestamp","EventDetectedAt","AvailableToModelAt","MaintenanceType",
+                 "Severity","Component","Duration","Resolved","ActionTaken","SolarImpact",
+                 "LagSteps","HorizonSteps","SiteKey"]
+checks["schema"] = all(c in logs.columns for c in req_logs_cols)
+
+# A2 Types
+checks["timestamp_types"] = (
+    pd.api.types.is_datetime64_any_dtype(logs["Timestamp"])
+    and pd.api.types.is_datetime64_any_dtype(logs["EventDetectedAt"])
+    and pd.api.types.is_datetime64_any_dtype(logs["AvailableToModelAt"])
+)
+
+# A3 Δ ≥ h enforcement in data (meta)
+# (We assert this in generation, but also check the stored columns if present)
+if "LagSteps" in logs.columns and "HorizonSteps" in logs.columns:
+    checks["delta_ge_h"] = (logs["LagSteps"] >= logs["HorizonSteps"]).all()
+else:
+    # Fall back to config
+    checks["delta_ge_h"] = (LAG_STEPS >= HORIZON_STEPS)
+
+# A4 Monotonic timing
+checks["timing_order"] = ((logs["EventDetectedAt"] <= logs["Timestamp"]) &
+                          (logs["Timestamp"] == logs["AvailableToModelAt"])).all()
+
+# A5 Fixed Δ within tolerance
+delta_target = LAG_STEPS * DATA_FREQ_MIN
+actual_delta = np.abs(minutes_diff(logs["Timestamp"], logs["EventDetectedAt"]))
+checks["delta_fixed"] = (np.abs(actual_delta - delta_target) <= DELTA_TOL_MIN).all()
+metrics["delta_minutes"] = {
+    "target": delta_target,
+    "median": float(np.median(actual_delta)),
+    "p95": float(np.percentile(actual_delta, 95))
+}
+
+# A6 Uniqueness (include SiteKey to avoid cross-site collisions)
+dup_count = logs.duplicated(subset=["Timestamp","SiteKey","MaintenanceType","Component"]).sum()
+checks["unique_key_site"] = (dup_count == 0)
+metrics["duplicates_key_site"] = int(dup_count)
+
+# A7 Text red flags (heuristic: forbid same-time numeric at now/t)
+redflag_pat = re.compile(r"(at\s*\d{1,2}:\d{2}|\bat time t\b|\bat t\b).*?(MW|kW|%)", re.IGNORECASE)
+redflags = logs["Description"].fillna("").str.contains(redflag_pat).sum()
+checks["no_same_time_numbers"] = (redflags == 0)
+metrics["text_redflags"] = int(redflags)
+
+# Print summary
+for k,v in checks.items():
+    print(f"[{passfail(v)}] {k}")
+
+# ========== B) DATA-QUALITY & PLAUSIBILITY ==========
+section("B) DATA-QUALITY & PLAUSIBILITY")
+
+# B1 Daily rate per site
+logs["day"] = logs["Timestamp"].dt.floor("D")
+daily_site = logs.groupby(["SiteKey","day"])["LogID"].count()
+metrics["daily_rate_per_site"] = {
+    "median": float(daily_site.median()) if len(daily_site) else 0.0,
+    "p95": float(daily_site.quantile(0.95)) if len(daily_site) else 0.0,
+    "p99": float(daily_site.quantile(0.99)) if len(daily_site) else 0.0
+}
+# sanity: p99 should be well below 500; adjust if your operation is unusually busy
+checks["daily_rate_reasonable"] = (metrics["daily_rate_per_site"]["p99"] <= 500)
+
+# B2 Type prevalence & balance
+type_share = (logs["MaintenanceType"].value_counts(normalize=True) * 100.0).sort_values(ascending=False)
+details["type_share_top"] = type_share.head(10).round(1).to_dict()
+# optional reasonableness: not more than, say, 80% a single type
+checks["type_balance_ok"] = (type_share.iloc[0] <= 80.0) if len(type_share) else True
+
+# B3 Severity distribution & Durations
+sev_order = ["Routine","Minor","Warning","Critical"]
+med_dur = logs.groupby("Severity")["Duration"].median().reindex(sev_order)
+# enforce monotonic increase ignoring missing categories
+valid = med_dur.dropna()
+checks["severity_duration_monotonic"] = valid.is_monotonic_increasing
+metrics["duration_medians_by_severity"] = {k: (None if pd.isna(v) else float(v)) for k,v in med_dur.items()}
+
+# B4 Detection lag distribution (should cluster at Δ)
+detect_lag = np.abs(minutes_diff(logs["Timestamp"], logs["EventDetectedAt"]))
+metrics["detection_lag"] = {
+    "median": float(np.median(detect_lag)),
+    "p95": float(np.percentile(detect_lag, 95))
+}
+checks["lag_centered_at_delta"] = (abs(metrics["detection_lag"]["median"] - delta_target) <= DELTA_TOL_MIN)
+
+# B5 Component × Type coverage
+ct = logs.pivot_table(index="Component", columns="MaintenanceType", values="LogID", aggfunc="count", fill_value=0)
+has_rows = (ct.sum(axis=1) > 0).all() if len(ct) else True
+has_cols = (ct.sum(axis=0) > 0).all() if len(ct.columns) else True
+checks["component_type_coverage"] = (has_rows and has_cols)
+details["component_type_table_sample"] = ct.head(10).to_dict()
+
+# B6 Site events/day sanity (distribution)
+site_days = logs.groupby("SiteKey")["day"].nunique().rename("active_days")
+site_events = logs.groupby("SiteKey")["LogID"].count().rename("events")
+rate = (pd.concat([site_days, site_events], axis=1)
+        .assign(events_per_day=lambda d: d["events"] / d["active_days"])
+        .replace([np.inf, -np.inf], np.nan).dropna())
+metrics["site_events_per_day"] = {
+    "median": float(rate["events_per_day"].median()) if len(rate) else 0.0,
+    "p95": float(rate["events_per_day"].quantile(0.95)) if len(rate) else 0.0
+}
+# sanity: typical ops ≪ 100 events/day/site
+checks["site_rate_reasonable"] = (metrics["site_events_per_day"]["p95"] < 100.0) if len(rate) else True
+
+# Print summary
+for k,v in list(checks.items())[len(checks)-7:]:
+    print(f"[{passfail(v)}] {k}")
+
+# ========== C) PROTOCOL / LEAKAGE GUARDS (STRUCTURAL) ==========
+section("C) LEAKAGE GUARDS (STRUCTURAL)")
+
+# C1 No future-peeking availability
+checks["no_future_availability"] = (logs["AvailableToModelAt"] <= logs["Timestamp"]).all()
+
+# C2 Δ ≥ h (as used in this validation)
+checks["config_delta_ge_h"] = (LAG_STEPS >= HORIZON_STEPS)
+
+# C3 Join-at-time sanity (informational)
+# If you join logs at time t (features) to predict y(t+h), availability is correct by design.
+# We report the share of rows that have at least one log at exact t (informational).
+aligned = df[["Timestamp_Aligned","SiteKey"]].rename(columns={"Timestamp_Aligned":"t"})
+logs_at_t = logs[["Timestamp","SiteKey","MaintenanceType"]].rename(columns={"Timestamp":"t"})
+joined = aligned.merge(logs_at_t, on=["t","SiteKey"], how="left")
+have_log = joined["MaintenanceType"].notna().mean() * 100.0
+metrics["rows_with_a_log_at_t_percent"] = float(have_log)
+
+for k,v in list(checks.items())[-2:]:
+    print(f"[{passfail(v)}] {k}")
+print(f"[INFO] rows with at least one log at exact t: {have_log:.1f}%")
+
+# ========== D) OPTIONAL FIGURES ==========
+if MAKE_FIGS:
+    try:
+        # Fig 1: Detection lag histogram
+        plt.figure(figsize=(6.6, 2.6))
+        plt.hist(detect_lag, bins=20)
+        plt.axvline(delta_target, linestyle="--", linewidth=1.2)
+        plt.xlabel("Detection lag (minutes)")
+        plt.ylabel("Event count")
+        plt.title("Validation: Detection Lag Distribution")
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUT_DIR, "val_detection_lag.png"), dpi=300)
+        plt.close()
+
+        # Fig 2: Daily rate distribution
+        daily_total = logs.groupby("day")["LogID"].count()
+        plt.figure(figsize=(6.6, 2.6))
+        plt.plot(daily_total.index, daily_total.values)
+        plt.xlabel("Date"); plt.ylabel("Events/day")
+        plt.title("Validation: Daily Event Volume")
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUT_DIR, "val_daily_rate.png"), dpi=300)
+        plt.close()
+
+        # Fig 3: Component × Type heatmap (count labels off; journal-friendly)
+        if len(ct):
+            plt.figure(figsize=(6.6, 3.6))
+            plt.imshow(ct.values, aspect="auto", interpolation="nearest")
+            plt.yticks(range(len(ct.index)), ct.index)
+            plt.xticks(range(len(ct.columns)), ct.columns, rotation=45, ha="right")
+            plt.colorbar(label="Count")
+            plt.title("Validation: Component × Maintenance Type")
+            plt.tight_layout()
+            plt.savefig(os.path.join(OUT_DIR, "val_type_component_heatmap.png"), dpi=300)
+            plt.close()
+    except Exception as e:
+        warn(f"Figure generation skipped: {e}")
+
+# ========== E) SAVE REPORTS ==========
+section("E) SAVING REPORTS")
+
+# JSON metrics
+metrics_out = {
+    "config": {
+        "DATA_FREQ_MIN": DATA_FREQ_MIN,
+        "LAG_STEPS": LAG_STEPS,
+        "HORIZON_STEPS": HORIZON_STEPS,
+        "DELTA_TOL_MIN": DELTA_TOL_MIN
+    },
+    "checks": {k: bool(v) for k,v in checks.items()},
+    "metrics": metrics,
+    "samples": {
+        "type_share_top": details.get("type_share_top", {}),
+        "component_type_table_head": details.get("component_type_table_sample", {})
+    }
+}
+with open(os.path.join(OUT_DIR, "logs_validation_metrics.json"), "w") as f:
+    json.dump(metrics_out, f, indent=2)
+
+# Markdown report (publication-ready)
+md_lines = []
+md_lines.append("# Maintenance Logs Validation Report\n")
+md_lines.append("This report verifies schema, causal timing (Δ enforcement), uniqueness, rate sanity, and leakage safeguards for the synthetic maintenance logs.\n")
+
+md_lines.append("## Configuration\n")
+md_lines.append(f"- Data frequency: **{DATA_FREQ_MIN}** minutes\n- Δ (LagSteps): **{LAG_STEPS}** steps ({LAG_STEPS*DATA_FREQ_MIN} min)\n- Forecast horizon h: **{HORIZON_STEPS}** steps\n- Δ ≥ h: **{passfail(LAG_STEPS>=HORIZON_STEPS)}**\n")
+
+md_lines.append("## A. Hard Invariants\n")
+for k,v in checks.items():
+    if k in ["schema","timestamp_types","delta_ge_h","timing_order","delta_fixed","unique_key_site","no_same_time_numbers"]:
+        md_lines.append(f"- {k}: **{passfail(v)}**")
+md_lines.append("")
+md_lines.append(f"- Δ minutes (target/median/p95): **{delta_target} / {metrics['delta_minutes']['median']:.2f} / {metrics['delta_minutes']['p95']:.2f}**")
+md_lines.append(f"- Duplicates on (Timestamp, SiteKey, MaintenanceType, Component): **{metrics['duplicates_key_site']}**\n")
+
+md_lines.append("## B. Data Quality & Plausibility\n")
+md_lines.append(f"- Daily events per site (median / p95 / p99): **{metrics['daily_rate_per_site']['median']:.2f} / {metrics['daily_rate_per_site']['p95']:.2f} / {metrics['daily_rate_per_site']['p99']:.2f}** — {passfail(checks['daily_rate_reasonable'])}")
+md_lines.append(f"- Type balance (top share ≤ 80%): **{passfail(checks['type_balance_ok'])}**  \n  Top types (%): `{details.get('type_share_top', {})}`")
+md_lines.append(f"- Severity→Duration monotonicity: **{passfail(checks['severity_duration_monotonic'])}**  \n  Medians: `{metrics['duration_medians_by_severity']}`")
+md_lines.append(f"- Detection lag centered at Δ: **{passfail(checks['lag_centered_at_delta'])}**  \n  Median/P95: **{metrics['detection_lag']['median']:.2f}/{metrics['detection_lag']['p95']:.2f}** minutes")
+md_lines.append(f"- Component×Type coverage: **{passfail(checks['component_type_coverage'])}**\n")
+
+md_lines.append("## C. Leakage Guards (Structural)\n")
+md_lines.append(f"- No future-peeking availability (AvailableToModelAt ≤ Timestamp): **{passfail(checks['no_future_availability'])}**")
+md_lines.append(f"- Configured Δ ≥ h: **{passfail(checks['config_delta_ge_h'])}**")
+md_lines.append(f"- Share of rows with at least one log at exact t (informational): **{metrics['rows_with_a_log_at_t_percent']:.1f}%**\n")
+
+if MAKE_FIGS:
+    md_lines.append("## Figures (optional)\n")
+    md_lines.append("- Detection lag distribution: `val_detection_lag.png`\n- Daily event volume: `val_daily_rate.png`\n- Component×Type heatmap: `val_type_component_heatmap.png`\n")
+
+with open(os.path.join(OUT_DIR, "logs_validation_report.md"), "w") as f:
+    f.write("\n".join(md_lines))
+
+print(f"[OK] Saved JSON: {os.path.join(OUT_DIR, 'logs_validation_metrics.json')}")
+print(f"[OK] Saved Markdown: {os.path.join(OUT_DIR, 'logs_validation_report.md')}")
+if MAKE_FIGS:
+    print("[OK] Saved figures (if enabled).")
