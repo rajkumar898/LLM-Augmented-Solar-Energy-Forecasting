@@ -127,8 +127,6 @@ All forecasting scripts allow selection of the case either by:
 
 ## 5. Repository Structure
 
-Adjust file names as needed to match your repo; a typical layout is:
-
 ```text
 .
 ├── data/
