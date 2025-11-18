@@ -1,6 +1,4 @@
 # Large Language Model-Based Context-Rich Solar Energy Forecasting: A Novel Multimodal Symbolic-Numeric Approach
-
-# Large Language Model-Based Context-Rich Renewable Energy Forecasting  
 _A multimodal symbolic–numeric framework for PV power prediction_
 
 ---
