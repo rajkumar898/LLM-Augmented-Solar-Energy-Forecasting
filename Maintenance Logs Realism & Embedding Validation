@@ -1,0 +1,226 @@
+# ==========================================================
+# Realism & Embedding Quality Validation for Maintenance Logs
+# - Works synthetic-only, or compares to real logs if provided
+# - Outputs: realism_report.md + PNG figures
+# ==========================================================
+
+import os, json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from datetime import timedelta
+from sklearn.metrics import silhouette_score, davies_bouldin_score, roc_auc_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from scipy.spatial.distance import cdist
+from scipy.stats import ks_2samp
+
+# ------------------ CONFIG (EDIT) ------------------
+SYNTH_CSV   = "/home/raj/RE Revision/Leakage_Free_Embeddings.csv"  # contains emb_1...emb_D
+REAL_CSV    = None  # "/path/to/Real_Maintenance_Logs_With_Embeddings.csv" (optional)
+OUT_DIR     = "/home/raj/RE Revision/realism_validation"
+SITE_COL    = "SiteKey"
+TIME_COL    = "Timestamp"             # if absent, script will adapt
+TYPE_COL    = "MaintenanceType"
+SEV_COL     = "Severity"
+DUR_COL     = "Duration"
+EMB_PREFIX  = "emb_"                  # embedding column prefix
+MIN_SAMPLES = 5000                    # subsample for speed if very large
+RANDOM_STATE= 42
+# ---------------------------------------------------
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ------------------ Load data ----------------------
+synth = pd.read_csv(SYNTH_CSV, parse_dates=[c for c in ["Timestamp","EventDetectedAt","AvailableToModelAt"] if c in pd.read_csv(SYNTH_CSV, nrows=0).columns])
+real = None
+if REAL_CSV and Path(REAL_CSV).exists():
+    real = pd.read_csv(REAL_CSV, parse_dates=[c for c in ["Timestamp","EventDetectedAt","AvailableToModelAt"] if c in pd.read_csv(REAL_CSV, nrows=0).columns])
+
+# Identify embedding columns
+emb_cols = [c for c in synth.columns if c.startswith(EMB_PREFIX)]
+if not emb_cols:
+    raise ValueError("No embedding columns found in synthetic CSV.")
+
+# Downsample (consistent)
+rng = np.random.default_rng(RANDOM_STATE)
+def downsample(df, n=MIN_SAMPLES):
+    if len(df) <= n:
+        return df.copy()
+    idx = np.sort(rng.choice(len(df), size=n, replace=False))
+    return df.iloc[idx].reset_index(drop=True)
+
+s_small = downsample(synth, MIN_SAMPLES)
+if real is not None:
+    # Ensure real has same emb columns; otherwise merge its embeddings first
+    if not all(c in real.columns for c in emb_cols):
+        raise ValueError("Real CSV is missing embedding columns; please merge embeddings into REAL_CSV.")
+    r_small = downsample(real, MIN_SAMPLES)
+else:
+    r_small = None
+
+# ------------------ A) Plausibility & realism (synthetic) ------------------
+report = []
+report.append("# Maintenance Logs Realism & Embedding Validation\n")
+
+# A1. Event rates & inter-arrival times
+if TIME_COL in synth.columns:
+    synth["day"] = pd.to_datetime(synth[TIME_COL]).dt.floor("D")
+    daily = synth.groupby("day")["LogID" if "LogID" in synth.columns else emb_cols[0]].count()
+    # inter-arrival (minutes) per site (or global)
+    def interarrival_minutes(df):
+        if TIME_COL not in df.columns: return pd.Series([], dtype=float)
+        g = df.sort_values(TIME_COL)
+        dt = g[TIME_COL].diff().dropna().dt.total_seconds() / 60.0
+        return dt[dt < 24*60]  # clip day-gaps that come from missing days
+    ia = synth.groupby(SITE_COL)[[TIME_COL]].apply(lambda g: interarrival_minutes(g)).explode().dropna().astype(float) if SITE_COL in synth.columns else interarrival_minutes(synth)
+
+    # Save figs
+    plt.figure(figsize=(6.5, 2.6))
+    plt.plot(daily.index, daily.values)
+    plt.xlabel("Date"); plt.ylabel("Events/day"); plt.title("Daily Event Volume (Synthetic)")
+    plt.tight_layout(); plt.savefig(os.path.join(OUT_DIR, "daily_events_synth.png"), dpi=300); plt.close()
+
+    if len(ia) > 0:
+        plt.figure(figsize=(6.5, 2.6))
+        plt.hist(ia, bins=40)
+        plt.xlabel("Inter-arrival (min)"); plt.ylabel("Count"); plt.title("Inter-arrival Distribution (Synthetic)")
+        plt.tight_layout(); plt.savefig(os.path.join(OUT_DIR, "interarrival_synth.png"), dpi=300); plt.close()
+
+    report.append("## A. Synthetic-only plausibility\n")
+    report.append(f"- Synthetic daily events: median={daily.median():.1f}, p95={daily.quantile(0.95):.1f} (see `daily_events_synth.png`).")
+    if len(ia) > 0:
+        report.append(f"- Inter-arrival (min): median={ia.median():.1f}, p95={ia.quantile(0.95):.1f} (see `interarrival_synth.png`).")
+
+# A2. Severity → Duration monotonicity
+if SEV_COL in synth.columns and DUR_COL in synth.columns:
+    sev_order = ["Routine","Minor","Warning","Critical"]
+    med_dur   = synth.groupby(SEV_COL)[DUR_COL].median().reindex(sev_order)
+    monotonic = med_dur.dropna().is_monotonic_increasing
+    report.append(f"- Severity→Duration medians (min): {med_dur.to_dict()} → monotonic={bool(monotonic)}")
+
+# ------------------ B) Embedding quality (synthetic) ------------------
+X = s_small[emb_cols].to_numpy().astype(np.float32)
+
+# B1. Silhouette / DB index with KMeans (unsupervised cohesion)
+# Choose K from number of types if available, else heuristic
+if TYPE_COL in s_small.columns:
+    K = max(2, min(10, s_small[TYPE_COL].nunique()))
+else:
+    K = 6
+km = KMeans(n_clusters=K, random_state=RANDOM_STATE, n_init="auto").fit(X)
+labels_km = km.labels_
+sil = silhouette_score(X, labels_km, metric="cosine")
+dbi = davies_bouldin_score(X, labels_km)
+report.append(f"## B. Embedding quality (synthetic)\n- KMeans(K={K}) silhouette (cosine): {sil:.3f} (higher is better)\n- Davies–Bouldin index: {dbi:.3f} (lower is better)")
+
+# B2. Cluster purity vs MaintenanceType (if available)
+if TYPE_COL in s_small.columns:
+    from collections import Counter
+    purity_counts = []
+    for k in range(K):
+        idx = np.where(labels_km == k)[0]
+        if len(idx) == 0: 
+            purity_counts.append(0)
+            continue
+        major = Counter(s_small.iloc[idx][TYPE_COL]).most_common(1)[0][1]
+        purity_counts.append(major / len(idx))
+    purity = float(np.mean(purity_counts))
+    report.append(f"- Cluster purity vs {TYPE_COL}: {purity:.3f} (0–1, higher is better)")
+
+# B3. Temporal drift in embedding space (optional)
+if TIME_COL in s_small.columns:
+    # Month-wise centroids and consecutive distances
+    months = pd.to_datetime(s_small[TIME_COL]).dt.to_period("M").astype(str)
+    centroids = s_small.groupby(months)[emb_cols].mean()
+    if len(centroids) >= 2:
+        dists = np.linalg.norm(np.diff(centroids.values, axis=0), axis=1)
+        report.append(f"- Temporal centroid drift: median Δ={np.median(dists):.4f}, p90 Δ={np.quantile(dists, 0.90):.4f}")
+
+# ------------------ C) Synthetic vs Real (optional) ------------------
+if r_small is not None:
+    report.append("\n## C. Synthetic vs Real comparisons\n")
+    # C1. Distributional alignment: daily rate & inter-arrival KS tests
+    if TIME_COL in s_small.columns and TIME_COL in r_small.columns:
+        def daily_counts(df):
+            d = pd.to_datetime(df[TIME_COL]).dt.floor("D")
+            return d.value_counts().sort_index().values
+        s_daily = daily_counts(synth)
+        r_daily = daily_counts(real)
+        if len(s_daily) > 10 and len(r_daily) > 10:
+            ks_daily = ks_2samp(s_daily, r_daily).statistic
+            report.append(f"- KS distance (daily events): {ks_daily:.3f} (0=identical, smaller is better)")
+        def interarrival(df):
+            g = df.sort_values(TIME_COL)
+            dt = g[TIME_COL].diff().dropna().dt.total_seconds()/60.0
+            return dt[dt < 24*60].values
+        s_ia = interarrival(synth); r_ia = interarrival(real)
+        if len(s_ia)>10 and len(r_ia)>10:
+            ks_ia = ks_2samp(s_ia, r_ia).statistic
+            report.append(f"- KS distance (inter-arrival): {ks_ia:.3f}")
+
+    # C2. Discriminator test: can a clf tell synthetic vs real?
+    # Build simple features: duration, severity (one-hot), type (one-hot), and a few emb PCs.
+    from sklearn.decomposition import PCA
+    tmp_s = s_small.copy(); tmp_s["is_synth"] = 1
+    tmp_r = r_small.copy(); tmp_r["is_synth"] = 0
+    common_cols = [SEV_COL, TYPE_COL, DUR_COL] + emb_cols
+    common_cols = [c for c in common_cols if c in tmp_s.columns and c in tmp_r.columns]
+    data = pd.concat([tmp_s[common_cols + ["is_synth"]], tmp_r[common_cols + ["is_synth"]]], ignore_index=True).dropna()
+    # one-hot of severity/type
+    data = pd.get_dummies(data, columns=[SEV_COL, TYPE_COL], drop_first=True)
+    # PCA on embeddings
+    emb_mat = data[[c for c in data.columns if c.startswith(EMB_PREFIX)]].values
+    pca = PCA(n_components=min(32, emb_mat.shape[1]), random_state=RANDOM_STATE).fit(emb_mat)
+    pcs = pca.transform(emb_mat)
+    for i in range(pcs.shape[1]):
+        data[f"emb_pc_{i}"] = pcs[:, i]
+    data = data.drop(columns=[c for c in data.columns if c.startswith(EMB_PREFIX)])
+    # split/train
+    X = data.drop(columns=["is_synth"]).values
+    y = data["is_synth"].values
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=RANDOM_STATE, stratify=y)
+    scaler = StandardScaler().fit(Xtr)
+    Xtr_s = scaler.transform(Xtr); Xte_s = scaler.transform(Xte)
+    clf = LogisticRegression(max_iter=200, n_jobs=None, random_state=RANDOM_STATE).fit(Xtr_s, ytr)
+    proba = clf.predict_proba(Xte_s)[:,1]
+    auc = roc_auc_score(yte, proba)
+    report.append(f"- Discriminator AUC (synthetic vs real): {auc:.3f} (closer to 0.5 = more realistic)")
+
+    # C3. TSTR utility: train on synthetic, test on real (simple task)
+    # Example task: predict Severity (multi-class) from embeddings PCs (+ type if present)
+    if SEV_COL in common_cols:
+        from sklearn.metrics import f1_score
+        # prepare synth train, real test
+        def prep(df):
+            d = df.copy()
+            d = pd.get_dummies(d, columns=[TYPE_COL] if TYPE_COL in d.columns else [], drop_first=True)
+            E = d[emb_cols].values
+            pcs = pca.transform(E)  # reuse the same PCA for parity
+            for i in range(pcs.shape[1]):
+                d[f"emb_pc_{i}"] = pcs[:, i]
+            cols_keep = [c for c in d.columns if c.startswith("emb_pc_")] + [c for c in d.columns if c.startswith(TYPE_COL+"_")]
+            d = d.drop(columns=[c for c in d.columns if c.startswith(EMB_PREFIX)])
+            d = d.dropna(subset=[SEV_COL])
+            return d[cols_keep], d[SEV_COL]
+        Xs, ys = prep(s_small), s_small[SEV_COL]
+        Xr, yr = prep(r_small), r_small[SEV_COL]
+        # encode severity labels
+        ymap = {k:i for i,k in enumerate(sorted(set(ys.dropna().unique()) | set(yr.dropna().unique())))}
+        ys_i = ys.map(ymap); yr_i = yr.map(ymap)
+        # train on synth → test on real
+        clf2 = LogisticRegression(max_iter=300, multi_class="auto", random_state=RANDOM_STATE).fit(Xs, ys_i)
+        yhat = clf2.predict(Xr)
+        macro_f1 = f1_score(yr_i, yhat, average="macro")
+        report.append(f"- TSTR (train on synthetic → test on real) macro-F1 for Severity: {macro_f1:.3f}")
+
+# ------------------ Save report ------------------
+with open(os.path.join(OUT_DIR, "realism_report.md"), "w") as f:
+    f.write("\n".join(report))
+
+print("\n".join(report))
+print(f"\n[OK] Saved report to: {os.path.join(OUT_DIR, 'realism_report.md')}")
+print(f"[OK] Saved figures (if any) to: {OUT_DIR}")
