@@ -1,0 +1,182 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# === EDIT if your file path changes ===
+IN_CSV = "/home/raj/RE Revision/Solar_Energy_Generation.csv"
+
+# --- Load ---
+df = pd.read_csv(IN_CSV, parse_dates=[c for c in ["Timestamp","Timestamp_Aligned","DateTime","datetime","time","ts"] if c in pd.read_csv(IN_CSV, nrows=0).columns])
+
+# --- Infer key columns (adjust if different) ---
+TIME_COL = next((c for c in ["Timestamp_Aligned","Timestamp","DateTime","datetime","time","ts"] if c in df.columns), None)
+SITE_COL = next((c for c in ["SiteKey","site","Site","Plant","PlantID","CampusKey"] if c in df.columns), None)
+GEN_COL  = next((c for c in ["SolarGeneration","Generation","Power","ActivePower","kW","MW","Gen"] if c in df.columns), None)
+
+if TIME_COL is None:
+    raise ValueError("Could not find a time column. Expected one of: Timestamp_Aligned, Timestamp, DateTime, datetime, time, ts")
+
+# --- Make output dir ---
+out_dir = Path(IN_CSV).parent / "empty_row_checks"
+out_dir.mkdir(parents=True, exist_ok=True)
+
+# --- 1) Missing keys ---
+missing_time = df[df[TIME_COL].isna()]
+missing_site = df[df[SITE_COL].isna()] if SITE_COL and SITE_COL in df.columns else pd.DataFrame()
+
+# --- 2) Rows where all numeric columns are NaN ---
+num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+empty_numeric = df[df[num_cols].isna().all(axis=1)] if num_cols else pd.DataFrame()
+
+# --- 3) SolarGeneration missing ---
+missing_gen = df[df[GEN_COL].isna()] if GEN_COL and GEN_COL in df.columns else pd.DataFrame()
+
+# --- 4) Duplicate (SiteKey, Timestamp) pairs ---
+if SITE_COL and SITE_COL in df.columns:
+    dup_mask = df.duplicated(subset=[SITE_COL, TIME_COL], keep=False)
+    duplicates = df[dup_mask].sort_values([SITE_COL, TIME_COL])
+else:
+    dup_mask = df.duplicated(subset=[TIME_COL], keep=False)
+    duplicates = df[dup_mask].sort_values([TIME_COL])
+
+# --- Save CSVs (only if non-empty) ---
+def save_if_any(frame: pd.DataFrame, name: str):
+    if len(frame):
+        path = out_dir / f"{name}.csv"
+        frame.to_csv(path, index=False)
+        print(f"[SAVED] {name}: {len(frame)} rows -> {path}")
+
+save_if_any(missing_time, "rows_missing_time")
+save_if_any(missing_site, "rows_missing_site")
+save_if_any(empty_numeric, "rows_all_numeric_NaN")
+save_if_any(missing_gen, "rows_missing_SolarGeneration")
+save_if_any(duplicates, "rows_duplicate_site_timestamp")
+
+# --- Summary ---
+print("\n=== EMPTY ROWS / INTEGRITY CHECK SUMMARY ===")
+print(f"File: {IN_CSV}")
+print(f"Time column: {TIME_COL} | Site column: {SITE_COL or 'NONE'} | Generation column: {GEN_COL or 'NONE'}")
+print(f"Total rows: {len(df):,}")
+print(f"- Rows with MISSING time: {len(missing_time):,}")
+print(f"- Rows with MISSING site: {len(missing_site):,}" if len(missing_site) else "- Rows with MISSING site: N/A")
+print(f"- Rows where ALL numeric cols are NaN: {len(empty_numeric):,}")
+print(f"- Rows with MISSING SolarGeneration: {len(missing_gen):,}" if len(missing_gen) else "- Rows with MISSING SolarGeneration: N/A")
+print(f"- Duplicate (site,timestamp) rows: {len(duplicates):,}")
+
+##################
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# ---------------- CONFIG (edit as needed) ----------------
+SOLAR_CSV   = "/home/raj/RE Revision/Solar_Energy_Generation.csv"
+OUT_DIR     = "/home/raj/RE Revision/solar_clean"
+TIME_COL    = "Timestamp"
+SITE_COL    = "SiteKey"
+GEN_COL     = "SolarGeneration"
+
+# If you don't have GHI/DNI, use an HOUR rule to set nights to zero (conservative)
+USE_NIGHT_RULE   = True
+NIGHT_HOURS_ZERO = list(range(0,6)) + list(range(19,24))   # 00–05 + 19–23 => 0
+
+# Causal daytime fill: only forward-fill up to this many steps (e.g., 4*15min=1h)
+DATA_FREQ_MIN    = 15
+MAX_FFILL_STEPS  = 4
+
+Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
+
+# ---------------- LOAD ----------------
+df = pd.read_csv(SOLAR_CSV, parse_dates=[TIME_COL])
+if SITE_COL not in df.columns:
+    df[SITE_COL] = "GLOBAL"
+
+# enforce sorting and consistent grid snap (helps joins later)
+df = df.sort_values([SITE_COL, TIME_COL]).reset_index(drop=True)
+df[TIME_COL] = df[TIME_COL].dt.round(f"{DATA_FREQ_MIN}T")
+
+# ---------------- SUMMARY of missingness ----------------
+miss_rate = df[GEN_COL].isna().mean()*100
+print(f"[INFO] Overall missing {GEN_COL}: {miss_rate:.2f}%")
+
+per_site_miss = (df
+    .groupby(SITE_COL)[GEN_COL]
+    .apply(lambda s: s.isna().mean()*100)
+    .sort_values(ascending=False))
+print("[INFO] Top sites by missing %:\n", per_site_miss.head(10))
+
+per_day_miss = (df
+    .assign(day=df[TIME_COL].dt.floor("D"))
+    .groupby("day")[GEN_COL].apply(lambda s: s.isna().mean()*100))
+per_day_miss.to_csv(Path(OUT_DIR, "solar_missing_by_day.csv"), index=True)
+print(f"[OK] Wrote per-day missingness: {Path(OUT_DIR, 'solar_missing_by_day.csv')}")
+
+# ---------------- OPTIONAL: night-time zeros ----------------
+# If you have GlobalHorizontalIrradiance (GHI), prefer: set GEN=0 where GHI==0.
+# Without GHI, a simple hour rule is acceptable; add a flag so it's transparent.
+df["hour"] = df[TIME_COL].dt.hour
+df["is_night_rule"] = False
+if USE_NIGHT_RULE:
+    night_mask = df["hour"].isin(NIGHT_HOURS_ZERO) & df[GEN_COL].isna()
+    n_nights = int(night_mask.sum())
+    if n_nights > 0:
+        df.loc[night_mask, GEN_COL] = 0.0
+        df.loc[night_mask, "is_night_rule"] = True
+        print(f"[INFO] Set {n_nights} night-time NaNs to 0 by hour rule.")
+
+# ---------------- CAUSAL limited forward-fill for short gaps ----------------
+# We only forward-fill (no backward fill), and we cap runs > MAX_FFILL_STEPS to remain NaN.
+def causal_ffill_limited(s: pd.Series, max_steps: int) -> pd.Series:
+    """
+    Forward fill but only for short gaps up to max_steps; longer gaps stay NaN.
+    """
+    vals = s.values.copy()
+    n = len(vals)
+    last = np.nan
+    run = 0
+    out = np.empty(n, dtype=float)
+    for i in range(n):
+        v = vals[i]
+        if pd.isna(v):
+            run += 1
+            if (last is not None) and (not np.isnan(last)) and (run <= max_steps):
+                out[i] = last
+            else:
+                out[i] = np.nan
+        else:
+            out[i] = v
+            last = v
+            run = 0
+    return pd.Series(out, index=s.index, dtype=float)
+
+# Apply per site
+df["is_ffill_shortgap"] = False
+clean_series = []
+for site, g in df.groupby(SITE_COL, sort=False):
+    filled = causal_ffill_limited(g[GEN_COL], MAX_FFILL_STEPS)
+    flag = g[GEN_COL].isna() & filled.notna()
+    gg = g.copy()
+    gg[GEN_COL] = filled
+    gg["is_ffill_shortgap"] = flag.values
+    clean_series.append(gg)
+
+dfc = pd.concat(clean_series, ignore_index=True)
+
+# ---------------- REPORT: what remains missing ----------------
+remaining_miss = dfc[GEN_COL].isna().mean()*100
+print(f"[INFO] Remaining missing {GEN_COL} after night+ffill: {remaining_miss:.2f}%")
+
+# Save cleaned file + flags
+out_path = Path(OUT_DIR, "Solar_Energy_Generation_CLEAN.csv")
+dfc.drop(columns=["hour"]).to_csv(out_path, index=False)
+print(f"[OK] Saved cleaned solar (with flags): {out_path}")
+
+# ---------------- NOTES for modeling ----------------
+print("""
+Next steps (to stay reviewer-safe):
+1) Use dfc['is_night_rule'] and dfc['is_ffill_shortgap'] as feature flags.
+2) When you create the forecasting target y(t+H), DROP rows where y(t+H) is NaN.
+3) Do NOT use backward fill (would peek into the future).
+4) Prefer models robust to NaNs (tree-based) or impute only inputs (not targets).
+""")
+
