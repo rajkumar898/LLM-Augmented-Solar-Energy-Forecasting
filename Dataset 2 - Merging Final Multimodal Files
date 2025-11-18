@@ -1,0 +1,179 @@
+import pandas as pd
+import numpy as np
+import os
+
+# ========= EDIT PATHS =========
+MERGED_CSV = "/home/raj/RE Revision/d2_solar+weather.csv"  # YOUR merged solar+weather dataset (Datetime, solar_mw, ...)
+LOGS_CSV   = "/home/raj/RE Revision/Synthetic_Maintenance_Logs_LeakageFree_v5_aligned.csv"
+EMB_CSV    = "/home/raj/RE Revision/Leakage_Free_Embeddings.csv"
+OUT_CSV    = "/home/raj/RE Revision/d2_Multimodal_Causal_W96_H4.csv"
+
+DATA_FREQ_MIN = 60         # set to 15 for 15-min data; here it matches your hourly data
+H = 4                     # prediction horizon (4 for next +4 hours, adjust as needed)
+W = 24                    # window for text features (24 for 24h; adjust if desired)
+MAX_WX_FFILL_STEPS = 2    # causal weather ffill cap (2 for 2h at 1h freq; =8 for 2h at 15-min)
+RANDOM_STATE = 42
+
+# ========= LOAD MERGED DATASET =========
+merged = pd.read_csv(
+    MERGED_CSV,
+    parse_dates=["Datetime"],
+    dayfirst=True              # << KEY CHANGE: for DD/MM/YYYY input
+)
+merged = merged.rename(columns={"Datetime": "Timestamp_Aligned", "solar_mw": "SolarGeneration"})
+
+logs = pd.read_csv(LOGS_CSV, parse_dates=["Timestamp", "EventDetectedAt", "AvailableToModelAt"])
+emb  = pd.read_csv(EMB_CSV)
+
+# ========= NORMALIZE KEYS & TIME =========
+for df, tcol in [(merged, "Timestamp_Aligned"), (logs, "AvailableToModelAt")]:
+    df[tcol] = pd.to_datetime(df[tcol]).dt.round(f"{DATA_FREQ_MIN}min")
+
+if "SiteKey" not in merged.columns:
+    merged["SiteKey"] = "GLOBAL"
+if "SiteKey" not in logs.columns:
+    if "CampusKey" in logs.columns:
+        logs = logs.rename(columns={"CampusKey": "SiteKey"})
+    else:
+        logs["SiteKey"] = "GLOBAL"
+if "SiteKey" not in emb.columns:
+    if "CampusKey" in emb.columns:
+        emb = emb.rename(columns={"CampusKey": "SiteKey"})
+    else:
+        emb["SiteKey"] = "GLOBAL"
+
+# ========= MERGE embeddings onto logs =========
+emb_cols = [c for c in emb.columns if c.startswith("emb_")]
+if not emb_cols:
+    raise ValueError("No emb_* columns in embeddings CSV.")
+
+if "LogID" in logs.columns and "LogID" in emb.columns:
+    logs = logs.merge(emb[["LogID"] + emb_cols], on="LogID", how="left")
+else:
+    if len(logs) != len(emb):
+        raise ValueError("Embeddings and logs have different lengths and no LogID to join on.")
+    for c in emb_cols:
+        logs[c] = emb[c].values
+
+# ========= BUILD text features on grid (available ≤ t, window [t-W, t]) =========
+merged = merged.sort_values(["SiteKey","Timestamp_Aligned"]).reset_index(drop=True)
+logs   = logs.sort_values(["SiteKey","AvailableToModelAt"]).reset_index(drop=True)
+
+def text_feats_for_site(g_sw, g_logs):
+    tgrid = g_sw["Timestamp_Aligned"].to_numpy()
+    T = len(tgrid)
+    if g_logs.empty:
+        out = pd.DataFrame({"SiteKey": g_sw["SiteKey"].iat[0], "Timestamp_Aligned": g_sw["Timestamp_Aligned"]})
+        out["logs_count_window"] = 0
+        out["logs_recency_min"]  = W * DATA_FREQ_MIN
+        for j in range(len(emb_cols)): out[f"text_emb_mean_{j}"] = 0.0
+        return out
+
+    avail = g_logs["AvailableToModelAt"].to_numpy()
+    idx = np.searchsorted(tgrid, avail)
+    valid = (idx >= 0) & (idx < T) & (tgrid[idx] == avail)
+    g_logs = g_logs.loc[valid].reset_index(drop=True)
+    idx = idx[valid]
+
+    D = len(emb_cols)
+    sumE = np.zeros((T, D), dtype=np.float32)
+    cntE = np.zeros(T, dtype=np.int32)
+    np.add.at(sumE, idx, g_logs[emb_cols].to_numpy(np.float32))
+    np.add.at(cntE, idx, 1)
+
+    csumE = np.cumsum(sumE, axis=0)
+    csumC = np.cumsum(cntE)
+    rollE = csumE.copy(); rollC = csumC.copy()
+    if W > 0:
+        rollE[W:] -= csumE[:-W]
+        rollC[W:] -= csumC[:-W]
+    meanE = np.where(rollC[:, None] > 0, rollE / rollC[:, None], 0.0).astype(np.float32)
+
+    last_seen = -10**9
+    last_idx  = np.full(T, -10**9, dtype=np.int32)
+    for i in range(T):
+        if cntE[i] > 0: last_seen = i
+        last_idx[i] = last_seen
+    rec_steps = np.clip(np.maximum(0, np.arange(T) - last_idx), 0, W)
+    rec_min   = rec_steps * DATA_FREQ_MIN
+
+    out = pd.DataFrame({"SiteKey": g_sw["SiteKey"].iat[0], "Timestamp_Aligned": g_sw["Timestamp_Aligned"].values})
+    out["logs_count_window"] = rollC.astype(np.int32)
+    out["logs_recency_min"]  = rec_min.astype(np.float32)
+    for j in range(D):
+        out[f"text_emb_mean_{j}"] = meanE[:, j]
+    return out
+
+site_frames = []
+for site, g_sw in merged.groupby("SiteKey", sort=False):
+    g_logs = logs[logs["SiteKey"] == site]
+    site_frames.append(text_feats_for_site(g_sw, g_logs))
+text_feats = pd.concat(site_frames, ignore_index=True)
+
+# ========= FINAL MERGE =========
+mm = merged.merge(text_feats, on=["SiteKey","Timestamp_Aligned"], how="left")
+
+# Fill text features with 0 where window empty
+text_cols = [c for c in mm.columns if c.startswith("text_emb_mean_") or c.startswith("logs_")]
+mm[text_cols] = mm[text_cols].fillna(0.0)
+
+# ========= CREATE TARGET y(t+H) & FILTER =========
+mm = mm.sort_values(["SiteKey","Timestamp_Aligned"]).reset_index(drop=True)
+if "SolarGeneration" not in mm.columns:
+    raise ValueError("SolarGeneration not found after merge. Check input columns.")
+
+mm["Target_t_plus_H"] = mm.groupby("SiteKey")["SolarGeneration"].shift(-H)
+
+# Drop last H rows per site (no target there)
+def drop_last_h(g): return g.iloc[:-H] if len(g) > H else g.iloc[0:0]
+mm = mm.groupby("SiteKey", group_keys=False).apply(drop_last_h).reset_index(drop=True)
+
+# Drop rows where future target is missing
+mm = mm[mm["Target_t_plus_H"].notna()].reset_index(drop=True)
+
+# ========= SAVE =========
+mm.to_csv(OUT_CSV, index=False)
+print(f"[OK] Multimodal dataset saved: {OUT_CSV}")
+print(f"Rows: {len(mm):,} | Text features: {len(text_cols)}")
+kept_flags = [c for c in ["is_night_rule","is_ffill_shortgap"] if c in mm.columns]
+print(f"Solar flags kept: {kept_flags}")
+
+####################################################################################
+# DATASET REPRESENTATION
+####################################################################################
+
+import pandas as pd
+
+# Path to your dataset
+dataset_path = '/home/raj/RE Revision/d2_solar+weather.csv'
+
+# Load the dataset
+df = pd.read_csv(dataset_path)
+
+# Number of rows and columns
+n_rows, n_cols = df.shape
+print(f"Number of rows: {n_rows}")
+print(f"Number of columns: {n_cols}")
+
+# Display the first five rows
+print(df.head())
+
+####################################################################################
+
+  import pandas as pd
+
+# Path to your dataset
+dataset_path = '/home/raj/RE Revision/Merged_Solar_Weather.csv'
+
+# Load the dataset
+df = pd.read_csv(dataset_path)
+
+# Number of rows and columns
+n_rows, n_cols = df.shape
+print(f"Number of rows: {n_rows}")
+print(f"Number of columns: {n_cols}")
+
+# Display the first five rows
+print(df.head())
+
+  
