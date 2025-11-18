@@ -101,20 +101,20 @@ standard ML models and strict causal evaluation protocols.
 
 We evaluate five configurations to ablate the contribution of each modality:
 
-1. **Case 1 – Solar + Weather (Baseline)**  
+1. **Case 1 – Solar Generation + Weather Forecasting (Baseline)**  
    - Numerical features: solar generation, weather covariates.
 
-2. **Case 2 – Solar + Logs**  
+2. **Case 2 – Solar Generation + Text Embedding Logs**  
    - Solar generation + log-derived numeric features
      (`logs_count_window`, `logs_recency_min`), without weather.
 
-3. **Case 3 – Weather + Logs**  
+3. **Case 3 – Weather Forecasting + Text Embedding Logs**  
    - Weather covariates + log embeddings and log-derived numeric features.
 
-4. **Case 4 – Logs Only**  
+4. **Case 4 – Text Embedding Logs Only**  
    - Log embeddings + log-derived numeric features without solar or weather.
 
-5. **Case 5 – Full Multimodal (Solar + Weather + Logs)**  
+5. **Case 5 – Full Multimodal (Solar + Weather + Text Embedding)**  
    - **Primary configuration**: combines solar, weather, and MiniLM log
      embeddings (plus numeric log features).
 
