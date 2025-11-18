@@ -1,0 +1,166 @@
+# ================================================================
+# Publication-ready plots for log embeddings (UMAP/TSNE/PCA fallback)
+# ================================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# -------------------- EDIT PATHS --------------------
+EMB_CSV = "/home/raj/RE Revision/Leakage_Free_Embeddings.csv"
+OUT_DIR = "/home/raj/RE Revision/emb_plots"
+
+# -------------------- SETTINGS ----------------------
+MAX_POINTS   = 60000    # downsample if dataset is huge (keeps plots readable)
+RANDOM_STATE = 42       # reproducibility
+POINT_SIZE   = 8
+ALPHA        = 0.65
+
+# -------------------- LOAD --------------------------
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# parse date columns if present
+head = pd.read_csv(EMB_CSV, nrows=0)
+date_cols = [c for c in ["Timestamp","EventDetectedAt","AvailableToModelAt"] if c in head.columns]
+df = pd.read_csv(EMB_CSV, parse_dates=date_cols)
+
+# find embedding columns
+emb_cols = [c for c in df.columns if c.startswith("emb_")]
+if not emb_cols:
+    raise ValueError("No embedding columns found (expected 'emb_1', 'emb_2', ...).")
+
+# optional metadata
+has_type = "MaintenanceType" in df.columns
+has_sev  = "Severity" in df.columns
+has_time = "AvailableToModelAt" in df.columns
+
+# downsample (consistent)
+rng = np.random.default_rng(RANDOM_STATE)
+if len(df) > MAX_POINTS:
+    keep = np.sort(rng.choice(len(df), size=MAX_POINTS, replace=False))
+    dfp = df.iloc[keep].reset_index(drop=True)
+else:
+    dfp = df.copy()
+
+X = dfp[emb_cols].to_numpy()
+
+# -------------------- 2D PROJECTION (UMAP → t-SNE → PCA) --------------------
+proj_name = None
+proj_2d   = None
+
+# small helper for PCA fallback
+from sklearn.decomposition import PCA
+def pca_2d(x):
+    return PCA(n_components=2, random_state=RANDOM_STATE).fit_transform(x), "PCA"
+
+try:
+    import umap
+    reducer = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.05,
+                        metric="cosine", random_state=RANDOM_STATE)
+    proj_2d = reducer.fit_transform(X)
+    proj_name = "UMAP"
+except Exception:
+    try:
+        from sklearn.manifold import TSNE
+        proj_2d = TSNE(n_components=2, learning_rate="auto", init="pca",
+                       perplexity=50, metric="cosine", random_state=RANDOM_STATE).fit_transform(X)
+        proj_name = "t-SNE"
+    except Exception:
+        proj_2d, proj_name = pca_2d(X)
+
+print(f"[INFO] Using {proj_name} projection. Shape: {proj_2d.shape}")
+
+PX, PY = proj_2d[:, 0], proj_2d[:, 1]
+
+# -------------------- STYLE --------------------
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.titlesize": 11,
+    "axes.labelsize": 10,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
+    "axes.linewidth": 0.8,
+    "savefig.dpi": 600
+})
+
+# simple color map for categories
+def make_color_map(values):
+    uniq = pd.Index(values).unique().tolist()
+    palette = plt.get_cmap("tab10").colors
+    cmap = {u: palette[i % len(palette)] for i, u in enumerate(uniq)}
+    return cmap, uniq
+
+# markers for severities
+sev_markers = {"Routine": "o", "Minor": "^", "Warning": "s", "Critical": "D"}
+
+# -------------------- FIG 1: colored by MaintenanceType --------------------
+fig1, ax1 = plt.subplots(figsize=(6.5, 3.6))
+if has_type:
+    cmap, order = make_color_map(dfp["MaintenanceType"])
+    for typ in order:
+        m = (dfp["MaintenanceType"] == typ).values
+        ax1.scatter(PX[m], PY[m], s=POINT_SIZE, alpha=ALPHA, c=[cmap[typ]], label=str(typ), edgecolors="none")
+    ax1.legend(loc="upper right", ncol=2, frameon=False, title="MaintenanceType")
+else:
+    ax1.scatter(PX, PY, s=POINT_SIZE, alpha=ALPHA, edgecolors="none")
+ax1.set_title(f"{proj_name} of Log Embeddings — by MaintenanceType")
+ax1.set_xlabel("Dim 1"); ax1.set_ylabel("Dim 2")
+plt.tight_layout()
+#fig1.savefig(os.path.join(OUT_DIR, "fig_emb_by_type.pdf"))
+fig1.savefig(os.path.join(OUT_DIR, "fig_emb_by_type.png"), dpi=600)
+plt.close(fig1)
+
+# -------------------- FIG 2: severity markers --------------------
+fig2, ax2 = plt.subplots(figsize=(6.5, 3.6))
+# faint background for context
+ax2.scatter(PX, PY, s=POINT_SIZE, alpha=0.15, color="#bbbbbb", edgecolors="none")
+if has_sev:
+    for sev in ["Routine", "Minor", "Warning", "Critical"]:
+        if sev in dfp["Severity"].values:
+            mask = (dfp["Severity"] == sev).values
+            ax2.scatter(PX[mask], PY[mask], s=POINT_SIZE+2, alpha=0.8,
+                        marker=sev_markers.get(sev, "o"), label=sev, edgecolors="none")
+    ax2.legend(loc="upper right", ncol=2, frameon=False, title="Severity")
+ax2.set_title(f"{proj_name} of Log Embeddings — Severity Markers")
+ax2.set_xlabel("Dim 1"); ax2.set_ylabel("Dim 2")
+plt.tight_layout()
+#fig2.savefig(os.path.join(OUT_DIR, "fig_emb_by_severity.pdf"))
+fig2.savefig(os.path.join(OUT_DIR, "fig_emb_by_severity.png"), dpi=600)
+plt.close(fig2)
+
+# -------------------- FIG 3: temporal bins (by quarter) --------------------
+fig3, ax3 = plt.subplots(figsize=(6.5, 3.6))
+if has_time:
+    quarters = pd.PeriodIndex(pd.to_datetime(dfp["AvailableToModelAt"]).dt.to_period("Q")).astype(str)
+    qmap, qorder = make_color_map(quarters)
+    for q in sorted(qorder):
+        m = (quarters == q).values
+        ax3.scatter(PX[m], PY[m], s=POINT_SIZE, alpha=ALPHA, c=[qmap[q]], label=q, edgecolors="none")
+    ax3.legend(loc="upper right", ncol=2, frameon=False, title="AvailableToModelAt (Quarter)")
+else:
+    ax3.scatter(PX, PY, s=POINT_SIZE, alpha=ALPHA, edgecolors="none")
+ax3.set_title(f"{proj_name} of Log Embeddings — Temporal Bins")
+ax3.set_xlabel("Dim 1"); ax3.set_ylabel("Dim 2")
+plt.tight_layout()
+#fig3.savefig(os.path.join(OUT_DIR, "fig_emb_by_time.pdf"))
+fig3.savefig(os.path.join(OUT_DIR, "fig_emb_by_time.png"), dpi=600)
+plt.close(fig3)
+
+# -------------------- FIG 4: PCA variance explained --------------------
+from sklearn.decomposition import PCA
+p = PCA(n_components=min(20, X.shape[1]), random_state=RANDOM_STATE).fit(X)
+var = p.explained_variance_ratio_
+fig4, ax4 = plt.subplots(figsize=(6.5, 2.6))
+ax4.bar(np.arange(1, len(var)+1), var * 100.0)
+ax4.set_xlabel("Principal component")
+ax4.set_ylabel("Explained variance (%)")
+ax4.set_title("Embedding Variance Explained (PCA)")
+plt.tight_layout()
+#fig4.savefig(os.path.join(OUT_DIR, "fig_emb_pca_variance.pdf"))
+fig4.savefig(os.path.join(OUT_DIR, "fig_emb_pca_variance.png"), dpi=600)
+plt.close(fig4)
+
+print(f"[OK] Saved figures in: {OUT_DIR}")
