@@ -1,0 +1,45 @@
+import pandas as pd
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import torch
+import os
+
+# ==== File path ====
+LOGS_PATH   = "/home/raj/RE Revision/Synthetic_Maintenance_Logs_LeakageFree_v5.csv"
+OUTPUT_PATH = "/home/raj/RE Revision/Leakage_Free_Embeddings.csv"
+
+# ==== Choose device: GPU if available ====
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# ==== Load leakage-free logs ====
+logs_df = pd.read_csv(LOGS_PATH, parse_dates=['Timestamp'])
+
+# === Generate combined text for embedding ===
+# Recommended: use 'Description' field
+texts = logs_df['Description'].fillna("").astype(str).tolist()
+
+# ==== Load SBERT model (MiniLM recommended for speed and 384-dim embedding) ====
+model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device=device)
+
+# ==== Generate embeddings ====
+print("Generating embeddings...")
+embeddings = model.encode(
+    texts,
+    batch_size=256,
+    show_progress_bar=True,
+    device=device,
+    normalize_embeddings=True  # cosine-ready, improves stability
+).astype(np.float32)
+
+print("Embeddings shape:", embeddings.shape)
+
+# ==== Add embeddings to DF as separate columns ====
+embeddings_df = pd.DataFrame(embeddings, columns=[f'emb_{i+1}' for i in range(embeddings.shape[1])])
+logs_df_with_emb = pd.concat([logs_df.reset_index(drop=True), embeddings_df], axis=1)
+
+# ==== Save result with embeddings ====
+os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+logs_df_with_emb.to_csv(OUTPUT_PATH, index=False)
+print(f"Embeddings added to logs and saved at: {OUTPUT_PATH}")
+print(logs_df_with_emb.head())
